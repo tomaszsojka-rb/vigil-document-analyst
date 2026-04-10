@@ -1,0 +1,39 @@
+# Unique identifier/name for this agent
+name: vigil-document-analyst
+# Brief description of what this agent does
+description: >
+  Vigil – Document Analyst: an AI agent that helps enterprise users analyze,
+  compare, and validate documents. Supports version comparison, compliance
+  checking against templates and standards, document pack completeness analysis,
+  fact extraction and cross-checking, and structured summary generation.
+  Large documents (200+ pages) are automatically chunked and indexed via
+  Azure AI Search for follow-up chat RAG retrieval.
+metadata:
+  authors:
+    - Microsoft
+  tags:
+    - Azure AI Agent Service
+    - Document Analysis
+    - Compliance
+    - RAG
+    - Azure AI Search
+    - Enterprise
+template:
+  name: vigil-document-analyst
+  kind: hosted
+  protocols:
+    - protocol: responses
+  environment_variables:
+    - name: FOUNDRY_PROJECT_ENDPOINT
+      value: ${AZURE_AI_PROJECT_ENDPOINT}
+    - name: FOUNDRY_MODEL_DEPLOYMENT_NAME
+      value: "gpt-4.1"
+    - name: AZURE_SEARCH_ENDPOINT
+      value: ${AZURE_SEARCH_ENDPOINT}
+resources:
+  - kind: model
+    id: gpt-4.1
+    name: chat
+  - kind: model
+    id: gpt-4.1-mini
+    name: chat-mini

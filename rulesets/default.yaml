@@ -1,0 +1,53 @@
+# Vigil — Example Gap Analysis Ruleset
+#
+# OPTIONAL: Rulesets are NOT loaded by default. To enable, set in your .env:
+#   GAP_ANALYSIS_RULESET=rulesets/default.yaml
+#
+# This is a starting-point template. Copy and customize for your use case.
+# Rules run between the Indexer and Analyzer stages for compliance_check
+# and document_pack workflows, injecting deterministic findings.
+#
+# Rule types:
+#   required_document  — Check that a document of a given type is present
+#   required_field     — Check that a specific fact exists in matching documents
+#   cross_check        — Check that a fact is consistent across documents
+#   condition          — Check that a numeric fact meets a threshold
+#
+# Severity: HIGH | MEDIUM | LOW
+# Label matching uses Python regex patterns (case-insensitive).
+
+name: Example Rules
+description: >
+  Minimal example ruleset demonstrating each rule type.
+  Enable via GAP_ANALYSIS_RULESET env var. Customize for your domain.
+
+rules:
+  # Example: check that documents identify the contracting parties
+  - id: example-001
+    type: required_field
+    name: Document should identify parties
+    category: party
+    label: "party|company|vendor|client|contractor"
+    severity: MEDIUM
+    fail_message: "No parties identified — document may be incomplete"
+    remediation: "Verify the document clearly identifies all parties"
+
+  # Example: check that monetary totals match across documents
+  - id: example-002
+    type: cross_check
+    name: Total amounts should be consistent
+    category: amount
+    label: "total|grand.total|contract.value|amount.due"
+    severity: HIGH
+    fail_message: "Total amounts differ across documents — possible pricing discrepancy"
+    remediation: "Verify that totals match across related documents"
+
+  # Example: check that effective dates are consistent
+  - id: example-003
+    type: cross_check
+    name: Effective dates should be consistent
+    category: date
+    label: "effective.date|effective|commencement"
+    severity: HIGH
+    fail_message: "Effective dates differ across documents"
+    remediation: "Align effective dates or document the reason for the difference"

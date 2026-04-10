@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Vigil — Document Analyst</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet"/>
+  <link href="https://cdn.jsdelivr.net/npm/remixicon@4.1.0/fonts/remixicon.css" rel="stylesheet"/>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <!-- ═══ Sidebar ═══ -->
+  <aside id="sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-logo"><i class="ri-shield-check-line"></i></div>
+      <div><span class="brand-name">Vigil</span><span class="brand-sub">Document Analyst</span></div>
+    </div>
+    <nav class="sidebar-nav">
+      <button class="nav-btn active" data-step="0"><span class="nav-num">1</span><span class="nav-label">Home</span></button>
+      <button class="nav-btn" data-step="1"><span class="nav-num">2</span><span class="nav-label">Upload</span></button>
+      <button class="nav-btn" data-step="2"><span class="nav-num">3</span><span class="nav-label">Workflow</span></button>
+      <button class="nav-btn" data-step="3"><span class="nav-num">4</span><span class="nav-label">Processing</span></button>
+      <button class="nav-btn" data-step="4"><span class="nav-num">5</span><span class="nav-label">Results</span></button>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="env-badge"><i class="ri-cloud-line"></i> Azure AI Foundry</div>
+      <div class="version-text">Vigil v2.0</div>
+    </div>
+  </aside>
+
+  <!-- ═══ Main ═══ -->
+  <main id="main">
+    <!-- Breadcrumbs -->
+    <div class="nav-steps">
+      <div class="step-box active" data-step="0"><div class="step-icon"><i class="ri-home-4-line"></i></div><span>Home</span></div>
+      <div class="step-connector"></div>
+      <div class="step-box" data-step="1"><div class="step-icon"><i class="ri-upload-cloud-2-line"></i></div><span>Upload</span></div>
+      <div class="step-connector"></div>
+      <div class="step-box" data-step="2"><div class="step-icon"><i class="ri-flow-chart"></i></div><span>Workflow</span></div>
+      <div class="step-connector"></div>
+      <div class="step-box" data-step="3"><div class="step-icon"><i class="ri-robot-2-line"></i></div><span>Processing</span></div>
+      <div class="step-connector"></div>
+      <div class="step-box" data-step="4"><div class="step-icon"><i class="ri-file-chart-line"></i></div><span>Results</span></div>
+      <div class="lang-dropdown" id="lang-dropdown">
+        <button class="lang-toggle-btn" onclick="document.getElementById('lang-dropdown').classList.toggle('open')">
+          <span id="lang-flag">🇬🇧</span>
+          <span id="lang-label">English</span>
+          <i class="ri-arrow-down-s-line"></i>
+        </button>
+        <div class="lang-menu">
+          <div class="lang-option" onclick="setLanguage('en')"><span>🇬🇧</span> English</div>
+          <div class="lang-option" onclick="setLanguage('pl')"><span>🇵🇱</span> Polski</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ PAGE 0 — Home ═══ -->
+    <section class="page active" id="page-0">
+      <div class="hero">
+        <div class="hero-glow"></div>
+        <div class="hero-content">
+          <div class="hero-badge"><i class="ri-sparkling-2-fill"></i> Multi-Agent AI Pipeline</div>
+          <h1>Meet <span class="accent">Vigil</span></h1>
+          <p class="hero-subtitle">Upload enterprise documents, pick an analysis workflow, and let three specialized AI agents extract, analyze, and advise — in seconds.</p>
+          <button class="btn-hero" onclick="goToStep(1)">Get Started <i class="ri-arrow-right-line"></i></button>
+        </div>
+      </div>
+
+      <div class="capability-grid">
+        <div class="cap-card" onclick="selectWorkflowAndGo('version_comparison')">
+          <div class="cap-icon cap-blue"><i class="ri-git-commit-line"></i></div>
+          <h3>Version Comparison</h3>
+          <p>Compare two versions of the same document — pricing, liability, term, and scope changes.</p>
+          <span class="cap-tag">2 documents</span>
+        </div>
+        <div class="cap-card" onclick="selectWorkflowAndGo('compliance_check')">
+          <div class="cap-icon cap-purple"><i class="ri-shield-check-line"></i></div>
+          <h3>Compliance Check</h3>
+          <p>Check a document against a reference standard. Finds deviations and non-compliant clauses.</p>
+          <span class="cap-tag">2 documents</span>
+        </div>
+        <div class="cap-card" onclick="selectWorkflowAndGo('document_pack')">
+          <div class="cap-icon cap-teal"><i class="ri-stack-line"></i></div>
+          <h3>Document Pack</h3>
+          <p>Analyze a set of related documents for completeness, conflicts, and gaps.</p>
+          <span class="cap-tag">2+ documents</span>
+        </div>
+        <div class="cap-card" onclick="selectWorkflowAndGo('fact_extraction')">
+          <div class="cap-icon cap-orange"><i class="ri-database-2-line"></i></div>
+          <h3>Fact Extraction</h3>
+          <p>Extract key facts and cross-check consistency across documents.</p>
+          <span class="cap-tag">1+ documents</span>
+        </div>
+        <div class="cap-card" onclick="selectWorkflowAndGo('summary')">
+          <div class="cap-icon cap-green"><i class="ri-file-text-line"></i></div>
+          <h3>Executive Summary</h3>
+          <p>Concise summaries, risk highlights, and recommended next actions.</p>
+          <span class="cap-tag">1+ documents</span>
+        </div>
+      </div>
+
+      <!-- ─── Meet the Agents ─── -->
+      <div class="agents-section">
+        <h2><i class="ri-robot-2-line"></i> Meet the Agents</h2>
+        <p class="agents-intro">Vigil uses a three-stage multi-agent pipeline. Each agent is a specialized LLM with tailored instructions, running on Azure AI Foundry. They communicate sequentially — the output of one becomes the input of the next — ensuring separation of concerns, auditability, and composability.</p>
+
+        <div class="agents-row">
+          <div class="agent-card" onclick="openAgentModal('indexer')">
+            <div class="agent-num">01</div>
+            <div class="agent-icon agent-blue"><i class="ri-search-eye-line"></i></div>
+            <h4>Indexer & Extractor</h4>
+            <p class="agent-summary">Parses documents and extracts structured facts — dates, amounts, parties, obligations — into a JSON fact sheet.</p>
+            <div class="agent-expand"><i class="ri-information-line"></i> View details</div>
+          </div>
+          <div class="agent-arrow"><i class="ri-arrow-right-line"></i></div>
+          <div class="agent-card" onclick="openAgentModal('analyzer')">
+            <div class="agent-num">02</div>
+            <div class="agent-icon agent-purple"><i class="ri-scales-3-line"></i></div>
+            <h4>Analyzer</h4>
+            <p class="agent-summary">Compares, checks compliance, cross-references facts, and identifies conflicts, gaps, and deviations.</p>
+            <div class="agent-expand"><i class="ri-information-line"></i> View details</div>
+          </div>
+          <div class="agent-arrow"><i class="ri-arrow-right-line"></i></div>
+          <div class="agent-card" onclick="openAgentModal('advisor')">
+            <div class="agent-num">03</div>
+            <div class="agent-icon agent-green"><i class="ri-lightbulb-flash-line"></i></div>
+            <h4>Advisor</h4>
+            <p class="agent-summary">Produces human-readable reports — executive summaries, risk highlights, remediation plans, and action items.</p>
+            <div class="agent-expand"><i class="ri-information-line"></i> View details</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══ PAGE 1 — Upload ═══ -->
+    <section class="page" id="page-1">
+      <div class="page-header">
+        <h2><i class="ri-upload-cloud-2-line"></i> Upload Documents</h2>
+        <p>Upload the documents you want to analyze. Supported formats: PDF, DOCX, TXT, XLSX, PNG, JPG, TIFF, BMP.</p>
+      </div>
+      <div class="upload-zone" id="drop-zone">
+        <div class="upload-icon"><i class="ri-folder-upload-line"></i></div>
+        <p class="upload-title">Drag & drop files here</p>
+        <p class="upload-sub">or click to browse — up to 50 MB per file</p>
+        <input type="file" id="file-input" multiple accept=".pdf,.docx,.txt,.xlsx,.xls,.png,.jpg,.jpeg,.tiff,.tif,.bmp" hidden/>
+        <div class="upload-loading hidden" id="upload-loading">
+          <div class="upload-loading-spinner"></div>
+          <p class="upload-loading-text">Processing files…</p>
+        </div>
+      </div>
+      <div id="uploaded-files" class="uploaded-list"></div>
+      <div class="page-actions">
+        <button class="btn-secondary" onclick="goToStep(0)"><i class="ri-arrow-left-line"></i> Back</button>
+        <button class="btn-primary" id="btn-to-workflow" disabled onclick="goToStep(2)">Choose Workflow <i class="ri-arrow-right-line"></i></button>
+      </div>
+    </section>
+
+    <!-- ═══ PAGE 2 — Workflow ═══ -->
+    <section class="page" id="page-2">
+      <div class="page-header">
+        <h2><i class="ri-flow-chart"></i> Select Analysis Workflow</h2>
+        <p>Choose what kind of analysis Vigil should perform on your documents.</p>
+      </div>
+      <div class="workflow-grid">
+        <div class="wf-card" data-wf="version_comparison"><div class="wf-icon wf-blue"><i class="ri-git-commit-line"></i></div><div class="wf-body"><h3>Version Comparison</h3><p>Compare two versions and get a detailed change log with business impact ratings.</p></div><div class="wf-check"><i class="ri-checkbox-circle-fill"></i></div></div>
+        <div class="wf-card" data-wf="compliance_check"><div class="wf-icon wf-purple"><i class="ri-shield-check-line"></i></div><div class="wf-body"><h3>Compliance Check</h3><p>Check against a reference standard and get a compliance matrix with remediation plan.</p></div><div class="wf-check"><i class="ri-checkbox-circle-fill"></i></div></div>
+        <div class="wf-card" data-wf="document_pack"><div class="wf-icon wf-teal"><i class="ri-stack-line"></i></div><div class="wf-body"><h3>Document Pack Analysis</h3><p>Analyze a document set for completeness, conflicts, duplications, and gaps.</p></div><div class="wf-check"><i class="ri-checkbox-circle-fill"></i></div></div>
+        <div class="wf-card" data-wf="fact_extraction"><div class="wf-icon wf-orange"><i class="ri-database-2-line"></i></div><div class="wf-body"><h3>Fact Extraction & Cross-Check</h3><p>Extract key facts and cross-check for inconsistencies across documents.</p></div><div class="wf-check"><i class="ri-checkbox-circle-fill"></i></div></div>
+        <div class="wf-card" data-wf="summary"><div class="wf-icon wf-green"><i class="ri-file-text-line"></i></div><div class="wf-body"><h3>Executive Summary</h3><p>Generate a concise overview with risk highlights and recommended actions.</p></div><div class="wf-check"><i class="ri-checkbox-circle-fill"></i></div></div>
+      </div>
+
+      <div class="custom-instructions">
+        <label for="custom-input"><i class="ri-chat-3-line"></i> Custom Instructions <span class="optional-tag">(optional)</span></label>
+        <textarea id="custom-input" placeholder="Tell Vigil what to focus on, e.g. 'Pay special attention to liability clauses and payment terms' or 'Compare only the financial sections'…" rows="3"></textarea>
+      </div>
+
+      <div class="page-actions">
+        <button class="btn-secondary" onclick="goToStep(1)"><i class="ri-arrow-left-line"></i> Back</button>
+        <button class="btn-primary" id="btn-run" disabled onclick="startPipeline()"><i class="ri-play-circle-line"></i> Run Analysis</button>
+      </div>
+    </section>
+
+    <!-- ═══ PAGE 3 — Processing ═══ -->
+    <section class="page" id="page-3">
+      <div class="page-header">
+        <h2><i class="ri-robot-2-line"></i> Agents Working</h2>
+        <p>Your documents are being processed through the three-stage AI pipeline.</p>
+      </div>
+      <div class="pipeline-visual">
+        <div class="pipe-stage" id="stage-indexer"><div class="pipe-icon"><i class="ri-search-eye-line"></i></div><div class="pipe-info"><h4>Agent 1 — Indexer & Extractor</h4><p>Parsing documents, extracting facts…</p></div><div class="pipe-status"><i class="ri-time-line" style="color:var(--text-muted)"></i></div></div>
+        <div class="pipe-connector"></div>
+        <div class="pipe-stage" id="stage-analyzer"><div class="pipe-icon"><i class="ri-scales-3-line"></i></div><div class="pipe-info"><h4>Agent 2 — Analyzer</h4><p>Comparing, checking, cross-referencing…</p></div><div class="pipe-status"><i class="ri-time-line" style="color:var(--text-muted)"></i></div></div>
+        <div class="pipe-connector"></div>
+        <div class="pipe-stage" id="stage-advisor"><div class="pipe-icon"><i class="ri-lightbulb-flash-line"></i></div><div class="pipe-info"><h4>Agent 3 — Advisor</h4><p>Generating report and recommendations…</p></div><div class="pipe-status"><i class="ri-time-line" style="color:var(--text-muted)"></i></div></div>
+      </div>
+      <div id="processing-log" class="processing-log"></div>
+    </section>
+
+    <!-- ═══ PAGE 4 — Results ═══ -->
+    <section class="page" id="page-4">
+      <div class="page-header">
+        <h2><i class="ri-file-chart-line"></i> Analysis Results</h2>
+        <p>All three agents have completed. Here's your report.</p>
+      </div>
+      <div class="result-tabs">
+        <button class="tab-btn active" data-tab="report">Final Report</button>
+        <button class="tab-btn" data-tab="indexer">Indexer Output</button>
+        <button class="tab-btn" data-tab="analyzer">Analyzer Output</button>
+      </div>
+      <div class="result-panel" id="result-report"></div>
+      <div class="result-panel hidden" id="result-indexer"></div>
+      <div class="result-panel hidden" id="result-analyzer"></div>
+      <div class="page-actions">
+        <button class="btn-secondary" onclick="resetAll()"><i class="ri-restart-line"></i> New Analysis</button>
+        <button class="btn-primary" onclick="copyReport()"><i class="ri-file-copy-line"></i> Copy Report</button>
+        <button class="btn-chat-toggle" id="btn-chat-toggle" onclick="toggleChatPanel()"><i class="ri-chat-3-line"></i> <span class="chat-toggle-label">Follow-up Chat</span></button>
+      </div>
+    </section>
+  </main>
+
+  <!-- ═══ Chat Sidebar Panel ═══ -->
+  <div id="chat-backdrop" class="chat-panel-backdrop" onclick="toggleChatPanel()"></div>
+  <aside id="chat-panel" class="chat-panel">
+    <div class="chat-panel-header">
+      <div class="chat-panel-title">
+        <div class="chat-panel-icon"><i class="ri-chat-3-line"></i></div>
+        <div>
+          <h3><span class="followup-title-text">Follow-up Chat</span></h3>
+          <p class="followup-desc">Ask questions about the analysis results.</p>
+        </div>
+      </div>
+      <button class="chat-panel-close" onclick="toggleChatPanel()"><i class="ri-close-line"></i></button>
+    </div>
+    <div id="chat-messages" class="chat-messages"></div>
+    <form id="chat-form" class="chat-input-area" onsubmit="sendChat(event)">
+      <div class="chat-input-wrapper">
+        <textarea id="chat-input" placeholder="Ask about the analysis results…" rows="1"></textarea>
+        <button type="button" class="chat-stop hidden" id="chat-stop-btn" onclick="stopChat()" title="Stop response"><i class="ri-stop-fill"></i></button>
+        <button type="submit" class="chat-send" id="chat-send-btn" disabled><i class="ri-arrow-up-line"></i></button>
+      </div>
+    </form>
+  </aside>
+
+  <!-- ═══ Agent Detail Modal ═══ -->
+  <div id="agent-modal" class="modal-overlay hidden"></div>
+
+  <!-- ═══ Tour Popup ═══ -->
+  <div id="tour-popup" class="tour-popup hidden">
+    <div class="tour-header">
+      <h4><i class="ri-compass-3-line"></i> <span id="tour-title"></span></h4>
+      <button class="tour-dismiss" onclick="endTour()">Skip tour</button>
+    </div>
+    <div class="tour-body">
+      <p id="tour-text"></p>
+      <div class="tour-dots" id="tour-dots"></div>
+      <div class="tour-actions">
+        <button class="tour-btn secondary" id="tour-prev" onclick="tourNav(-1)">Back</button>
+        <button class="tour-btn primary" id="tour-next" onclick="tourNav(1)">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

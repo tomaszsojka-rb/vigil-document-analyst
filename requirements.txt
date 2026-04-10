@@ -1,0 +1,18 @@
+# Azure AI
+azure-ai-agents>=1.2.0b5
+azure-search-documents>=11.6.0
+azure-identity
+python-dotenv
+aiohttp
+
+# Document parsing
+PyMuPDF
+pdfplumber
+python-docx
+openpyxl
+
+# OCR via Azure AI Document Intelligence
+azure-ai-documentintelligence>=1.0.0
+
+# Gap analysis YAML DSL rules
+PyYAML

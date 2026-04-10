@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+.git/
+.vscode/
+.foundry/
+*.md
+uploads/
+restart.ps1
+stop.ps1
