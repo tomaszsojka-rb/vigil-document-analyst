@@ -70,13 +70,13 @@ Vigil is an AI-powered document analyst that helps enterprise users analyze, com
 │  │  + Tour  │ │ drag&drop│ │  picker  │ │ live view │ │ + chat  │  │
 │  └──────────┘ └──────────┘ └──────────┘ └───────────┘ └─────────┘  │
 └──────────────────────────┬───────────────────────────────────────────┘
-                           │ POST /api/run
+                           │ POST /api/upload + POST /api/run
 ┌──────────────────────────▼───────────────────────────────────────────┐
 │                    Orchestrator (app.py)                              │
-│  • Multipart file upload + doc parsing                               │
+│  • Multipart upload + server-side parsing session                     │
 │    (Python libraries + Document Intelligence OCR)                     │
 │  • Async job management with TTL cleanup                             │
-│  • Input validation (workflow whitelist, message length caps)         │
+│  • Input validation (workflow whitelist, upload/document IDs, caps)   │
 └──────────┬───────────────┬──────────────────┬────────────────────────┘
            │               │                  │
            ▼               ▼                  ▼
@@ -91,29 +91,29 @@ Vigil is an AI-powered document analyst that helps enterprise users analyze, com
            │               │                │
            └───────────────┼────────────────┘
                            │
-               Azure AI Foundry Agent Service
+               Azure AI Foundry + Inference SDK
                ┌───────────┴───────────┐
-               │      AgentsClient     │
+               │  ChatCompletionsClient │
                │  DefaultAzureCredential│
-               │ Indexer/Analyzer: GPT-4.1-mini│
-               │ Advisor: GPT-4.1      │
+               │  Model per agent (configurable)│
+               │  Defaults: see .env.template  │
                └───────────────────────┘
 ```
 
 ### Data Flow
 
 1. **User uploads** documents via the web UI (drag & drop or file picker).
-2. **Doc parser** extracts text and tables via Python libraries (PyMuPDF, python-docx, openpyxl) with Azure AI Document Intelligence OCR for scanned documents.
-3. **Orchestrator** creates an async job and passes documents through the 3-agent pipeline.
+2. **Upload route** parses each file on the server, stores parsed content in an in-memory upload session, and returns only document metadata plus an `upload_id` to the browser.
+3. **Orchestrator** resolves the selected documents from that server-side upload session, creates an async job, and passes documents through the 3-agent pipeline.
 4. **Agent 1 (Indexer)** receives raw text → produces structured JSON fact sheets.
 5. **Agent 2 (Analyzer)** receives the fact sheets + workflow-specific instructions → produces analysis JSON.
 6. **Agent 3 (Advisor)** receives the analysis JSON → produces a human-readable markdown report.
-7. **Results page** renders the markdown report with tables, risk ratings, and action items. Users can switch tabs to inspect raw Indexer/Analyzer JSON.
+7. **Results page** renders the markdown report with tables, risk ratings, and action items. Markdown is sanitized in the browser before insertion. Users can switch tabs to inspect raw Indexer/Analyzer JSON.
 8. **Follow-up chat** lets users ask questions about the analysis with full pipeline context.
 
 ### Agent Communication
 
-All three agents run as **persistent Foundry agents** via the Azure AI Agent Service SDK. They are registered once at startup (`find-or-create` pattern) and reused across requests. Each invocation creates a new **thread** (conversation), sends the input as a user message, and polls for completion. Agents never share threads — each pipeline run is isolated.
+All three agents are **registered in Foundry** at startup (`find-or-create` pattern) for portal visibility and management, but at runtime they use **direct chat completions** via the Azure AI Inference SDK (`ChatCompletionsClient`). Each invocation is a single HTTP call — no threads, no polling. This provides lower latency and model flexibility (each agent can target a different deployment). Pipeline runs are fully isolated — each request gets independent API calls.
 
 ---
 
@@ -217,7 +217,7 @@ Vigil uses **Python libraries** for document parsing:
 - **openpyxl** for Excel spreadsheets (all sheets)
 - **Azure AI Document Intelligence OCR** for scanned PDFs and images (PNG, JPG, TIFF, BMP)
 
-Text-based formats work out of the box with no Azure services required. Set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` to enable OCR for scanned documents.
+Text-based formats work out of the box with no Azure services required. Set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` to enable OCR for scanned documents, or let Vigil derive the base cognitive endpoint from `FOUNDRY_PROJECT_ENDPOINT`.
 
 ### Supported File Formats
 
@@ -236,6 +236,7 @@ Text-based formats work out of the box with no Azure services required. Set `AZU
 Each parser catches all exceptions (not just `ImportError`). If a file is corrupted or unreadable:
 
 - The upload endpoint returns **partial results** — successfully parsed files are included alongside error details.
+- Parsed document content stays on the server in a short-lived upload session; the browser only receives metadata and IDs.
 - The frontend shows a styled error banner for any files that failed to parse.
 - The pipeline continues with whatever documents were successfully parsed.
 
@@ -254,7 +255,7 @@ For documents exceeding ~30 pages (~15,000 words), Vigil automatically switches 
     │ split into ~4,000-word chunks with 200-word overlap
     ▼
   ┌─────────────────────────────────────────────┐
-  │  Concurrent chunk processing (max 3 parallel) │
+  │  Concurrent chunk processing (max 5 parallel) │
   │  Chunk 1 → Indexer thread → facts JSON       │
   │  Chunk 2 → Indexer thread → facts JSON       │
   │  Chunk 3 → Indexer thread → facts JSON       │
@@ -275,7 +276,7 @@ For documents exceeding ~30 pages (~15,000 words), Vigil automatically switches 
 
 1. **Automatic detection** — If any uploaded document exceeds 15,000 words, the chunked path is activated.
 2. **Chunking** — The document is split into ~4,000-word chunks with 200-word overlap at boundaries to preserve context.
-3. **Concurrent extraction** — Each chunk is sent to the Indexer agent in a separate thread, with up to 3 running concurrently (bounded by a semaphore to avoid rate limits).
+3. **Concurrent extraction** — Each chunk is sent to the Indexer agent in a separate thread, with up to 5 running concurrently (bounded by a semaphore to avoid rate limits).
 4. **Merge & deduplication** — Extracted facts from all chunks are merged into a single fact sheet. Facts are deduplicated by `(category, label, value)`. Document metadata (title, type, version) is taken from the first chunk that provides it.
 5. **Azure AI Search indexing** (optional) — If `AZURE_SEARCH_ENDPOINT` is configured, chunks are indexed in a `vigil-document-chunks` Search index. The follow-up chat uses semantic search over these chunks to retrieve relevant sections when answering questions.
 6. **Downstream pipeline unchanged** — The Analyzer and Advisor receive the same merged fact sheet JSON as they would from a small document.
@@ -307,14 +308,14 @@ Rule types: `required_document`, `required_field`, `cross_check`, `condition`. S
 
 | Component | Technology | Why |
 |-----------|-----------|-----|
-| **AI Model** | GPT-4.1-mini (Indexer, Analyzer) + GPT-4.1 (Advisor) via Azure AI Foundry Agent Service | Mini for fast structured JSON extraction; full model for report quality. Streaming advisor output. |
-| **Agent SDK** | `azure-ai-agents` | Azure AI Agent Service SDK: create agents, threads, messages, runs |
+| **AI Model** | Configurable per agent via env vars (defaults: `gpt-4.1-mini` for Indexer/Analyzer, `gpt-4.1` for Advisor) | Each agent can target a different model deployment. Override via `FOUNDRY_INDEXER_MODEL`, `FOUNDRY_ANALYZER_MODEL`, `FOUNDRY_ADVISOR_MODEL` |
+| **Agent SDK** | `azure-ai-agents` + `azure-ai-inference` | `azure-ai-agents` for agent registration in Foundry portal; `azure-ai-inference` (`ChatCompletionsClient`) for all runtime LLM calls |
 | **Search** | Azure AI Search (semantic + keyword) | RAG grounding for follow-up chat on large (200+ page) documents |
 | **Doc parsing** | PyMuPDF, pdfplumber, python-docx, openpyxl | Text and table extraction from PDF, DOCX, XLSX, TXT |
 | **OCR** | Azure AI Document Intelligence (prebuilt-layout) | OCR for scanned documents and images with table preservation |
 | **Backend** | Python 3.10+ with aiohttp | Lightweight async web server, native asyncio support |
-| **Auth** | `DefaultAzureCredential` (Entra ID) | No API keys in code; works with `az login`, managed identity, and service principals |
-| **Frontend** | Vanilla HTML/CSS/JS | Zero build step, no node_modules, instant load; Remix Icons + marked.js for markdown |
+| **Auth** | `DefaultAzureCredential` + optional API key / platform auth gate | Foundry and OCR use Entra ID; Search can use RBAC or `AZURE_SEARCH_API_KEY`; external demos can require `VIGIL_API_KEY` or platform identity headers |
+| **Frontend** | Vanilla HTML/CSS/JS | Zero build step, no node_modules, instant load; Remix Icons + marked.js + DOMPurify for markdown |
 
 ---
 
@@ -335,8 +336,8 @@ vigil-document-analyst/
 │                           #   - Chunk index creation + upload for follow-up chat RAG
 │                           #   - Semantic + keyword search over document chunks
 ├── routes/
-│   ├── __init__.py         # Shared config, validation constants, job store
-│   ├── upload.py           # POST /api/upload — file upload & document parsing
+│   ├── __init__.py         # Shared config, validation constants, job/upload-session stores
+│   ├── upload.py           # POST /api/upload — file upload, parsing, server-side upload sessions
 │   ├── pipeline.py         # POST /api/run, GET /api/job — 3-agent pipeline orchestration
 │   └── chat.py             # POST /api/chat — follow-up conversation with RAG
 ├── agents/
@@ -352,7 +353,6 @@ vigil-document-analyst/
 ├── Dockerfile              # Container image for deployment
 ├── .env.template           # Environment variable reference
 ├── requirements.txt        # Python dependencies
-├── DEMO_SCRIPT.md          # Demo walkthrough script
 ├── LICENSE                 # MIT license
 ├── restart.ps1             # Recreate Azure resources after stop
 └── stop.ps1                # Delete expensive resources (model deployment + search)
@@ -368,7 +368,7 @@ vigil-document-analyst/
 
 | Resource | Required | Purpose |
 |----------|:--------:|---------|
-| Azure AI Services (Cognitive Services) | ✅ | Hosts the GPT-4.1 model deployment + Foundry Agent Service |
+| Azure AI Services (Cognitive Services) | ✅ | Hosts model deployments + Foundry Agent Service |
 | Azure AI Search (Basic tier) | Optional | Semantic search for follow-up chat RAG on large (200+ page) documents |
 | Azure AI Document Intelligence | Optional | OCR for scanned PDFs and images |
 
@@ -378,8 +378,7 @@ Your identity (or service principal) needs these roles:
 
 | Role | Scope | Why |
 |------|-------|-----|
-| `Azure AI Developer` | Foundry project | Agent and thread operations |
-| `Azure AI User` | AI Services resource | Agent create/run |
+| `Azure AI Developer` | Foundry project | Agent registration and management operations |
 | `Cognitive Services OpenAI Contributor` | AI Services resource | Chat completions model access |
 | `Search Index Data Contributor` | AI Search resource | Read/write document index (if using search) |
 | `Search Service Contributor` | AI Search resource | Create/manage search indexes (if using search) |
@@ -436,14 +435,31 @@ Copy `.env.template` to `.env` and fill in your values:
 | `FOUNDRY_ANALYZER_MODEL` | — | `gpt-4.1-mini` | Model for Agent 2 (Analyzer). Uses mini for speed — structured JSON output |
 | `FOUNDRY_ADVISOR_MODEL` | — | `gpt-4.1` | Model for Agent 3 (Advisor). Uses full model for report quality |
 | `AZURE_SEARCH_ENDPOINT` | — | — | Azure AI Search endpoint URL (used for follow-up chat RAG on large documents). Optional — app works without it |
+| `AZURE_SEARCH_API_KEY` | — | — | Optional Azure AI Search API key fallback when RBAC is not available |
 | `AZURE_SEARCH_CHUNKS_INDEX` | — | `vigil-document-chunks` | Name of the chunks index for RAG |
-| `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` | — | — | Document Intelligence endpoint for OCR on scanned documents. Falls back to `FOUNDRY_PROJECT_ENDPOINT` |
+| `AZURE_SEARCH_FACTS_INDEX` | — | `vigil-facts` | Name of the facts index for Analyzer RAG context |
+| `SEARCH_FACTS_TOP_K` | — | `15` | Max facts retrieved from Search for Analyzer context |
+| `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` | — | — | Azure AI Document Intelligence endpoint for OCR. If omitted, Vigil derives the cognitive endpoint from `FOUNDRY_PROJECT_ENDPOINT` |
+| `PDF_OCR_MODE` | — | `auto` | PDF OCR policy: `off`, `auto`, `hybrid`, or `force` |
+| `PDF_MIN_EMBEDDED_TEXT_CHARS` | — | `120` | In `auto`/`hybrid`, trigger OCR when embedded PDF text is below this size |
+| `PDF_LOW_TEXT_PAGE_CHARS` | — | `35` | A page is considered low-text when extracted text is below this char count |
+| `PDF_LOW_TEXT_PAGE_RATIO` | — | `0.4` | In `auto`/`hybrid`, trigger OCR when low-text pages exceed this ratio |
+| `PDF_OCR_MIN_GAIN_FACTOR` | — | `1.15` | In `auto`, OCR replaces embedded text only when OCR text is significantly richer |
 | `VIGIL_PORT` | — | `3000` | Local server port |
 | `VIGIL_ALLOWED_ORIGINS` | — | — | Comma-separated CORS allowed origins (e.g., `https://your-app.azurewebsites.net`). Empty = deny all cross-origin |
+| `VIGIL_API_KEY` | — | — | Optional shared secret for protecting `/api/*` in external demos or client deployments |
+| `VIGIL_REQUIRE_PLATFORM_AUTH` | — | `false` | If `true`, `/api/*` requires upstream platform identity headers (for example Easy Auth or trusted reverse proxy auth) |
+| `VIGIL_MAX_FILE_MB` | — | `50` | Maximum size for a single uploaded file |
+| `VIGIL_MAX_REQUEST_MB` | — | `100` | Maximum total request size accepted by aiohttp |
+| `VIGIL_MAX_FILES` | — | `20` | Maximum files accepted in one upload request |
+| `UPLOAD_SESSION_TTL_SECONDS` | — | `3600` | How long parsed upload sessions are kept in memory before expiry |
 | `LARGE_DOC_THRESHOLD` | — | `15000` | Word count above which chunked processing is used |
 | `CHUNK_SIZE` | — | `4000` | Words per chunk for large document processing |
 | `CHUNK_OVERLAP` | — | `200` | Word overlap between consecutive chunks |
 | `MAX_CONCURRENT_CHUNKS` | — | `5` | Max parallel chunk processing threads for large documents |
+| `INDEXER_RETRY_ATTEMPTS` | — | `2` | Retry count for malformed/non-JSON Indexer responses before deterministic fallback |
+| `INDEXER_FALLBACK_MAX_NUMBERS` | — | `200` | Max numeric entries captured in deterministic fallback extraction |
+| `INDEXER_FALLBACK_QUOTE_MAX_CHARS` | — | `12000` | Max quoted text retained in deterministic fallback section snapshots |
 | `GAP_ANALYSIS_RULESET` | — | — | Path to a YAML ruleset for deterministic gap analysis (e.g., `rulesets/default.yaml`). Not loaded by default — see [Gap Analysis Rulesets](#gap-analysis-rulesets-optional) |
 
 ---
@@ -453,7 +469,7 @@ Copy `.env.template` to `.env` and fill in your values:
 ### Step-by-Step
 
 1. **Home** — Browse the five capabilities, read about the three agents. An interactive guided tour starts on first visit.
-2. **Upload** — Drag & drop files or click to browse. Supported: PDF, DOCX, TXT, XLSX, PNG, JPG, TIFF, BMP. Documents are parsed via Python libraries (PyMuPDF, python-docx, openpyxl) with Document Intelligence OCR for scans.
+2. **Upload** — Drag & drop files or click to browse. Supported: PDF, DOCX, TXT, XLSX, PNG, JPG, TIFF, BMP. Documents are parsed server-side via Python libraries (PyMuPDF, python-docx, openpyxl) with Document Intelligence OCR for scans.
 3. **Workflow** — Select one of five analysis types. Optionally add custom instructions (e.g., "Focus on financial impact").
 4. **Processing** — Watch the three-stage pipeline execute in real time: Indexer → Analyzer → Advisor.
 5. **Results** — Read the Advisor's markdown report. Switch tabs to inspect raw Indexer JSON and Analyzer JSON. Use the follow-up chat to ask questions about the results.
@@ -581,7 +597,7 @@ The AI Services account itself is free when idle (no deployment). Only the model
 ## Design Decisions & Best Practices
 
 ### Single-client pattern
-All agent operations use a **single `AgentsClient`** singleton (`foundry_client.py`), authenticated via `DefaultAzureCredential`. This follows the Azure AI Agent Service best practice of sharing one client instance across all agent runtime operations (create, list, threads, messages, runs) for connection pooling and consistent auth handling.
+`foundry_client.py` provides two singletons: an `AgentsClient` for agent registration (create/update/list at startup) and per-model `ChatCompletionsClient` instances for all runtime LLM calls. Both authenticate via `DefaultAzureCredential`. The `ChatCompletionsClient` is cached per model deployment, so the Indexer, Analyzer, and Advisor each get a dedicated client pointed at their deployment endpoint.
 
 ### Agent registration separated from invocation
 Agents are registered once at startup (`ensure_agents()`) and reused across requests. This follows the hackathon best practice: agent registration in a deployment pipeline, agent invocation at runtime. The `find-or-create` pattern means re-deploying the app doesn't create duplicate agents.
@@ -606,8 +622,8 @@ Follow-up chat context is **truncated** (stage outputs to 8K chars, final report
 - **Agent JSON parse failures** return a consistent `{"error": "..."}` field so the pipeline detects and reports failures cleanly instead of silently passing broken data downstream.
 - **The Advisor agent** wraps its run in try/except and returns markdown-formatted error messages instead of crashing.
 
-### DefaultAzureCredential everywhere
-No API keys in code. Azure AI Foundry Agent Service and (optionally) Azure AI Search all authenticate via `DefaultAzureCredential`. This works with `az login` locally, managed identity in containers, and service principals in CI/CD.
+### DefaultAzureCredential by default
+Azure AI Foundry and Document Intelligence use `DefaultAzureCredential`. Azure AI Search also prefers RBAC with `DefaultAzureCredential`, but the app supports `AZURE_SEARCH_API_KEY` as a fallback when RBAC is not practical. For public-facing demos or client environments, you can additionally require `VIGIL_API_KEY` or upstream platform auth headers on `/api/*`.
 
 ---
 
@@ -615,16 +631,18 @@ No API keys in code. Azure AI Foundry Agent Service and (optionally) Azure AI Se
 
 | Concern | How it's handled |
 |---------|-----------------|
-| **Secrets in code** | None. All credentials via `DefaultAzureCredential` (Entra ID tokens). `.env` is gitignored |
-| **Azure AI Search auth** | RBAC-only via `DefaultAzureCredential`. Assign "Search Index Data Contributor" role to your identity |
-| **Security headers** | CSP, X-Frame-Options (DENY), X-Content-Type-Options, Referrer-Policy, Permissions-Policy on all responses |
+| **Secrets in code** | None. `.env` is gitignored. Azure credentials come from `DefaultAzureCredential`; optional app/API secrets are supplied via environment variables |
+| **Azure AI Search auth** | Preferred: RBAC via `DefaultAzureCredential`. Fallback: `AZURE_SEARCH_API_KEY` for isolated demos or locked-down service environments |
+| **API access** | Same-origin localhost by default. Optional `VIGIL_API_KEY` and `VIGIL_REQUIRE_PLATFORM_AUTH` protect `/api/*` for external deployments |
+| **Security headers** | CSP, X-Frame-Options (DENY), X-Content-Type-Options, Referrer-Policy, Permissions-Policy, COOP, and CORP on all responses |
 | **CORS** | Denied by default. Configure `VIGIL_ALLOWED_ORIGINS` for cross-origin access |
-| **File upload** | 50 MB limit server-side. File extension allowlist enforced (PDF, DOCX, TXT, XLSX, PNG, JPG, TIFF, BMP). Only text extracted — no code execution |
-| **Input validation** | Workflow and language whitelisted. Job IDs validated against `^[a-f0-9\-]{1,36}$`. Chat messages capped at 10K chars. History capped at 30 entries |
+| **File upload** | 50 MB per file and 100 MB per request by default. File extension allowlist enforced (PDF, DOCX, TXT, XLSX, PNG, JPG, TIFF, BMP). Parsed content stays server-side in an expiring upload session |
+| **Input validation** | Workflow and language whitelisted. Upload/job IDs validated against strict patterns. Chat messages capped at 10K chars. History capped at 30 entries |
+| **HTML injection / XSS** | LLM-generated markdown is sanitized with DOMPurify before insertion into the DOM |
 | **Error sanitization** | Internal errors logged server-side; only generic messages returned to clients |
 | **OData injection** | Search filter `job_id` values sanitized to alphanumeric + hyphens |
 | **Context injection** | Agent prompts use structured formats; user input isolated in designated fields |
-| **Job isolation** | Each pipeline run creates a new Foundry thread — no cross-request data leakage |
+| **Job isolation** | Each pipeline run uses independent direct chat-completions calls; jobs and upload sessions are isolated per process with TTL cleanup |
 
 ---
 
@@ -638,7 +656,7 @@ No API keys in code. Azure AI Foundry Agent Service and (optionally) Azure AI Se
 | `Indexer returned no documents` | Token limit exceeded or malformed input | Try smaller documents or enable chunked processing by lowering `LARGE_DOC_THRESHOLD` |
 | `Chunk search failed` | Azure AI Search not configured or index missing | Set `AZURE_SEARCH_ENDPOINT` in `.env` — the chunks index is auto-created on first large document upload |
 | `Search index not found` | Search service was deleted by `stop.ps1` | Run `.\restart.ps1` to recreate the search service |
-| `OCR requires AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` | Scanned PDF uploaded without Document Intelligence OCR configured | Set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` in `.env`, or use text-based PDFs |
+| `OCR requires AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT or FOUNDRY_PROJECT_ENDPOINT` | Scanned PDF uploaded without an OCR-capable endpoint configured | Set `AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT` in `.env`, or provide `FOUNDRY_PROJECT_ENDPOINT` so Vigil can derive the cognitive endpoint |
 | `DOCX/XLSX parsing error` | Corrupted or password-protected file | Re-save the file in a supported format without password protection |
 | App hangs on startup | Foundry endpoint unreachable or credential issue | Check network connectivity and ensure `az account get-access-token` succeeds |
 | `stop.ps1` doesn't stop the app | App not running on port 3000 | Stop the process manually via Task Manager, or run `Get-Process python \| Stop-Process` |
@@ -655,7 +673,7 @@ Vigil agents persist in Azure AI Foundry between app restarts. To force a clean 
 
 ## Performance
 
-Approximate processing times (GPT-4.1, 10 TPM capacity):
+Approximate processing times (default model config, 10 TPM capacity). Actual times depend on which models are deployed:
 
 | Document size | Chunked? | Indexer | Analyzer | Advisor | Total |
 |:---:|:---:|:---:|:---:|:---:|:---:|
@@ -670,7 +688,7 @@ Approximate processing times (GPT-4.1, 10 TPM capacity):
 
 | Component | Cost driver | Approximate cost |
 |-----------|-----------|----------|
-| **GPT-4.1** | Token usage (~100K tokens per 100-page analysis) | ~$0.50–$1.00 per run |
+| **LLM usage** | Token usage (~100K tokens per 100-page analysis) | Varies by model — check Azure pricing for your deployed models |
 | **Azure AI Search (Basic)** | Fixed monthly | ~$75/month (use `stop.ps1` when idle) |
 | **Document Intelligence OCR** | Per page processed | ~$0.01 per page (scanned docs only) |
 | **AI Services account** | Free when no deployment | $0 when idle |
@@ -689,11 +707,30 @@ This is a demo/POC project. Contributions welcome — please open an issue first
 
 ---
 
+## Quality Gate
+
+Run this before committing to keep backend and frontend quality checks green:
+
+```powershell
+./quality.ps1
+```
+
+This executes:
+
+- Ruff checks for unused imports/variables and undefined names.
+- Vulture dead-code scan.
+- Python compile check across the repository.
+- JavaScript syntax check for `static/app.js`.
+
+The same checks run in CI on every push and pull request via `.github/workflows/quality.yml`.
+
+---
+
 ## Production Deployment
 
 ### Deploy to Azure Container Apps
 
-Vigil ships with a production-ready `Dockerfile`. To deploy to Azure Container Apps:
+Vigil ships with a demo-ready `Dockerfile`. For client deployments, keep a single replica until you externalize the in-memory job and upload-session state. To deploy to Azure Container Apps:
 
 ```bash
 # Build and push to Azure Container Registry
@@ -715,7 +752,7 @@ az containerapp create \
   --target-port 3000 \
   --ingress external \
   --min-replicas 1 \
-  --max-replicas 5 \
+  --max-replicas 1 \
   --cpu 1.0 --memory 2.0Gi \
   --env-vars \
     FOUNDRY_PROJECT_ENDPOINT=<your-endpoint> \
@@ -737,12 +774,12 @@ az role assignment create --role "Search Service Contributor" --assignee $IDENTI
 
 | Concern | Current (Demo) | Production Recommendation |
 |---------|---------------|---------------------------|
-| **Job store** | In-memory dict (100 jobs, 1h TTL) | Replace with Azure Redis Cache or Cosmos DB for persistence across replicas |
-| **Concurrency** | Single-process aiohttp | Container Apps auto-scaling (1–5+ replicas) handles horizontal scale; each replica runs independently |
+| **Job + upload state** | In-memory dicts with TTL cleanup | Replace with Azure Redis Cache / Cosmos DB + durable blob storage before enabling multi-replica scale-out |
+| **Concurrency** | Single-process aiohttp | Keep a single replica until state is externalized; then scale horizontally |
 | **Model throughput** | 10 TPM (tokens per minute) | Increase model deployment capacity (`--sku-capacity`) or use provisioned throughput for guaranteed latency |
 | **File storage** | Uploaded files kept in-memory only | Add Azure Blob Storage for durable document storage and support for larger files |
-| **Rate limits** | Exponential backoff with 4 retries | Increase `MAX_CONCURRENT_CHUNKS` and model quota together; add request queuing for burst traffic |
-| **Authentication** | None (open localhost) | Add Azure Entra ID (AAD) authentication via Easy Auth on Container Apps, or add an API key middleware |
+| **Rate limits** | No built-in retry (direct chat completions) | Add retry middleware or increase model quota; add request queuing for burst traffic |
+| **Authentication** | None by default on localhost; optional `VIGIL_API_KEY` / platform-auth gate available | Prefer Azure Entra ID (Easy Auth / reverse proxy auth) for client deployments and keep the API key as a fallback control |
 | **Monitoring** | Console logging only | Enable Azure Application Insights via `opencensus-ext-azure` or OpenTelemetry for tracing, metrics, and alerting |
 
 ---

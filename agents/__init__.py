@@ -1,10 +1,10 @@
 """
 Vigil agents package.
 
-All three agents (Indexer, Analyzer, Advisor) are registered as persistent
-Foundry agents via the Azure AI Agent Service SDK. On startup, existing agents
-are reused if found; otherwise new ones are created. Agents are NOT deleted
-on shutdown so they remain visible in the Foundry portal.
+All three agents (Indexer, Analyzer, Advisor) use direct chat completions
+via the Azure AI Inference SDK at runtime for lower latency. They are also
+registered in Azure AI Foundry so they appear in the Foundry portal for
+visibility and management.
 
 """
 
@@ -41,16 +41,12 @@ def find_agent_by_name(name: str) -> str | None:
     return agent_id
 
 
-def get_agent_id(name: str) -> str:
-    """Get the Foundry agent ID for a registered agent."""
-    agent_id = _agent_ids.get(name)
-    if not agent_id:
-        raise RuntimeError(f"Agent '{name}' not registered. Call ensure_agents() first.")
-    return agent_id
-
-
 async def ensure_agents() -> dict[str, str]:
-    """Find or create the three pipeline agents in Foundry. Returns agent IDs."""
+    """Register all three agents in Foundry for portal visibility.
+
+    All three agents use direct chat completions at runtime.
+    Registration here makes them visible in the Foundry portal.
+    """
     from agents.indexer import ensure_indexer_agent
     from agents.analyzer import ensure_analyzer_agent
     from agents.advisor import ensure_advisor_agent

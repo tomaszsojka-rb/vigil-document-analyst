@@ -1,13 +1,13 @@
 """
 Agent 3 — Advisor
-Registered as a Foundry agent via Azure AI Agent Service SDK.
+Uses direct chat completions via Azure AI Inference SDK (with streaming).
 Produces human-readable reports: risk assessments, recommendations, executive summaries.
 """
 
 import json
 import logging
 
-from foundry_client import get_agents_client, get_advisor_model_name
+from foundry_client import get_inference_client, get_advisor_model_name
 
 logger = logging.getLogger("vigil.agents.advisor")
 
@@ -284,7 +284,7 @@ The reader should understand every document without seeing them.
 ### 3. Key Numbers & Data Points
 **This section is MANDATORY.** A table of the most important numbers in the documents:
 | # | What | Value (Exact Quote) | Source **[file, section]** | Why It Matters |
-If numbers appear in multiple documents, note whether they are consistent. \
+Render EVERY entry present in the Analyzer's `key_numbers` list. If numbers appear in multiple documents, note whether they are consistent. \
 After the table, provide brief narrative context.
 
 ### 4. Key Findings by Area
@@ -344,47 +344,51 @@ Instead, use <br> for line breaks within a table cell. Keep each table row on a 
 Use markdown formatting throughout. Write for a professional audience.
 """
 
-
 AGENT_NAME = "vigil-advisor"
 
 
 def ensure_advisor_agent() -> str:
-    """Find or create the Advisor agent in Foundry. Updates instructions if agent exists."""
+    """Register the Advisor agent in Foundry for portal visibility.
+
+    Runtime calls use direct chat completions (not the Assistants API),
+    but registering here makes the agent visible in the Foundry portal.
+    """
     from agents import find_agent_by_name
+    from foundry_client import get_agents_client, get_advisor_model_name as _get_model
 
     client = get_agents_client()
-    model = get_advisor_model_name()
+    model = _get_model()
     existing_id = find_agent_by_name(AGENT_NAME)
     if existing_id:
-        client.update_agent(
-            agent_id=existing_id,
-            model=model,
-            instructions=BASE_INSTRUCTIONS,
-            temperature=0.3,
-        )
-        logger.info("Updated Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, existing_id)
+        try:
+            kwargs = dict(agent_id=existing_id, model=model, instructions=BASE_INSTRUCTIONS)
+            try:
+                client.update_agent(**kwargs, temperature=0.3)
+            except Exception:
+                client.update_agent(**kwargs)
+            logger.info("Updated Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, existing_id)
+        except Exception as exc:
+            logger.warning("Could not update agent '%s', using existing: %s", AGENT_NAME, exc)
         return existing_id
 
-    agent = client.create_agent(
-        model=model,
-        name=AGENT_NAME,
-        instructions=BASE_INSTRUCTIONS,
-        temperature=0.3,
-    )
+    try:
+        agent = client.create_agent(model=model, name=AGENT_NAME, instructions=BASE_INSTRUCTIONS, temperature=0.3)
+    except Exception:
+        agent = client.create_agent(model=model, name=AGENT_NAME, instructions=BASE_INSTRUCTIONS)
     logger.info("Created Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, agent.id)
     return agent.id
 
 
 def run_advisor_streaming(workflow: str, analyzer_output: dict, language: str = "en", custom_instructions: str = ""):
-    """Run the Advisor agent with streaming. Yields text chunks as they arrive.
+    """Run the Advisor agent with streaming via direct chat completions.
 
+    Yields text chunks as they arrive.
     This is a synchronous generator — call from a thread via run_in_executor.
     """
-    from agents import get_agent_id
-    from azure.ai.agents.models import AgentStreamEvent, MessageDeltaChunk, MessageDeltaTextContent
+    from azure.ai.inference.models import SystemMessage, UserMessage
 
-    client = get_agents_client()
-    agent_id = get_agent_id("advisor")
+    model = get_advisor_model_name()
+    client = get_inference_client(model)
 
     instructions = WORKFLOW_INSTRUCTIONS.get(workflow, WORKFLOW_INSTRUCTIONS["summary"])
 
@@ -398,20 +402,22 @@ def run_advisor_streaming(workflow: str, analyzer_output: dict, language: str = 
     if custom_instructions:
         instructions += f"\n\nUSER'S SPECIFIC INSTRUCTIONS: {custom_instructions}"
 
-    user_message = f"{instructions}\n\nAnalysis data:\n\n{json.dumps(analyzer_output, indent=2)}\n\nProduce your report now."
+    system_prompt = f"{BASE_INSTRUCTIONS}\n\n{instructions}"
+    user_message = f"Analysis data:\n\n{json.dumps(analyzer_output, indent=2)}\n\nProduce your report now."
 
-    # Create thread, send message
-    thread = client.threads.create()
-    client.messages.create(thread_id=thread.id, role="user", content=user_message)
+    call_kwargs = dict(
+        messages=[
+            SystemMessage(content=system_prompt),
+            UserMessage(content=user_message),
+        ],
+        stream=True,
+    )
+    # Some models (e.g. gpt-5.4) don't support temperature
+    try:
+        response = client.complete(**call_kwargs, temperature=0.3)
+    except Exception:
+        response = client.complete(**call_kwargs)
 
-    # Stream the run
-    with client.runs.stream(thread_id=thread.id, agent_id=agent_id) as stream:
-        for event_type, event_data, _ in stream:
-            if isinstance(event_data, MessageDeltaChunk) and event_data.delta:
-                content = event_data.delta.content
-                if content:
-                    for part in content:
-                        if isinstance(part, MessageDeltaTextContent) and part.text:
-                            text_value = part.text.get("value", "")
-                            if text_value:
-                                yield text_value
+    for chunk in response:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            yield chunk.choices[0].delta.content

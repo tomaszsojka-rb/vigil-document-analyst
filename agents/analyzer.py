@@ -1,6 +1,7 @@
 """
 Agent 2 — Analyzer
-Registered as a Foundry agent via Azure AI Agent Service SDK.
+Uses direct chat completions via Azure AI Inference SDK with Structured Outputs.
+Forces JSON output via response_format to eliminate broken JSON responses.
 Performs the core analytical work: version comparison, compliance checking,
 cross-document consistency analysis, and gap detection.
 """
@@ -8,12 +9,13 @@ cross-document consistency analysis, and gap detection.
 import asyncio
 import json
 import logging
+import re
 
-from azure.ai.agents.models import ListSortOrder
-
-from foundry_client import get_agents_client, get_analyzer_model_name, run_with_retry
+from foundry_client import get_agents_client, get_analyzer_model_name, get_inference_client
 
 logger = logging.getLogger("vigil.agents.analyzer")
+
+AGENT_NAME = "vigil-analyzer"
 
 WORKFLOW_INSTRUCTIONS = {
     "version_comparison": """\
@@ -355,6 +357,10 @@ For each document, produce a 3-5 sentence description with source filename.
 ### B. Key Numbers & Financial Summary (HIGHEST PRIORITY when applicable)
 Identify the most important numbers in the documents and present them prominently. \
 If multiple documents share numbers, highlight consistency or discrepancies.
+Always surface material monetary amounts, prices, fees, contract durations, effective dates, deadlines, thresholds, and caps when they appear in the extracted data. \
+If a recurring fee, total amount, contractual period, or pricing figure appears in the sections, facts, or `number_registry`, include it explicitly in `key_numbers` and in the relevant findings. \
+Do NOT say a value is missing if it appears anywhere in the provided extracted data.
+If there are only a few material numbers in the extracted data, include all of them rather than selecting a subset.
 
 ### C. Theme Identification & Key Findings
 Identify the most important themes based on the ACTUAL DOCUMENT CONTENT. \
@@ -397,6 +403,10 @@ key financial/commercial highlights, critical items, and overall assessment",
     "summary": "..."
   }
 }
+
+IMPORTANT FOR SUMMARY WORKFLOWS: If pricing, fee amounts, contract durations, deadlines, \
+or liability caps are present, they are material and should normally appear in both \
+`key_numbers` and the final summary.
 """,
 }
 
@@ -417,6 +427,9 @@ Use the `number_registry` from fact sheets to find every discrepancy.
 2. **Exact quotes** — Every finding must cite specific source files and sections with verbatim text.
 3. **Exhaustiveness** — It is better to report too many findings than to miss any.
 4. **Document overviews** — Always include a 3-5 sentence description of each document.
+5. **Authoritative extracted data** — When structured reference data is provided, treat it as the authoritative extracted record. \
+Do not claim a fact, quote, amount, duration, deadline, or cap is missing if it appears in that structured reference data, even if it is absent from narrower retrieved snippets.
+6. **Semantic consistency** — Explicitly check for cross-document contradictions in meaning, terminology, units, timelines, obligations, and legal interpretation.
 
 Always classify findings by risk dimension and severity (HIGH, MEDIUM, LOW). \
 Use risk dimensions that match the actual content — do not force categories that don't apply.
@@ -424,9 +437,6 @@ Use risk dimensions that match the actual content — do not force categories th
 CRITICAL: Always use actual uploaded filenames (from the `source_file` field in fact sheets) \
 in your output — NEVER use generic identifiers like "doc-1", "Document 1", etc.
 """
-
-
-AGENT_NAME = "vigil-analyzer"
 
 
 def ensure_analyzer_agent() -> str:
@@ -437,46 +447,67 @@ def ensure_analyzer_agent() -> str:
     model = get_analyzer_model_name()
     existing_id = find_agent_by_name(AGENT_NAME)
     if existing_id:
-        client.update_agent(
-            agent_id=existing_id,
-            model=model,
-            instructions=BASE_INSTRUCTIONS,
-            temperature=0.1,
-        )
-        logger.info("Updated Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, existing_id)
+        try:
+            kwargs = dict(agent_id=existing_id, model=model, instructions=BASE_INSTRUCTIONS)
+            try:
+                client.update_agent(**kwargs, temperature=0.1)
+            except Exception:
+                client.update_agent(**kwargs)
+            logger.info("Updated Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, existing_id)
+        except Exception as exc:
+            logger.warning("Could not update agent '%s', using existing: %s", AGENT_NAME, exc)
         return existing_id
 
-    agent = client.create_agent(
-        model=model,
-        name=AGENT_NAME,
-        instructions=BASE_INSTRUCTIONS,
-        temperature=0.1,
-    )
+    try:
+        agent = client.create_agent(model=model, name=AGENT_NAME, instructions=BASE_INSTRUCTIONS, temperature=0.1)
+    except Exception:
+        agent = client.create_agent(model=model, name=AGENT_NAME, instructions=BASE_INSTRUCTIONS)
     logger.info("Created Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, agent.id)
     return agent.id
 
 
-def _call_analyzer_sync(client, agent_id: str, user_message: str) -> str:
-    """Synchronous Foundry Analyzer call — runs in a thread-pool executor."""
-    thread = client.threads.create()
-    client.messages.create(thread_id=thread.id, role="user", content=user_message)
-    run = run_with_retry(client.runs.create_and_process, thread_id=thread.id, agent_id=agent_id)
-    if run.status == "failed":
-        raise RuntimeError(f"Analyzer run failed: {run.last_error}")
-    messages = client.messages.list(thread_id=thread.id, order=ListSortOrder.ASCENDING)
-    for msg in messages:
-        if msg.role == "assistant" and msg.text_messages:
-            return msg.text_messages[-1].text.value
-    return ""
+def _call_analyzer_sync(system_prompt: str, user_message: str) -> str:
+    """Synchronous chat completion call with Structured Outputs (json_object mode).
+
+    Uses the Azure AI Inference SDK for a single HTTP call with
+    response_format={'type': 'json_object'} to guarantee valid JSON output.
+    """
+    from azure.ai.inference.models import SystemMessage, UserMessage
+
+    model = get_analyzer_model_name()
+    client = get_inference_client(model)
+
+    call_kwargs = dict(
+        messages=[
+            SystemMessage(content=system_prompt),
+            UserMessage(content=user_message),
+        ],
+    )
+    # Try with structured outputs (json_object), fall back without if unsupported
+    try:
+        response = client.complete(**call_kwargs, response_format={"type": "json_object"}, temperature=0.1)
+    except Exception:
+        try:
+            response = client.complete(**call_kwargs, response_format={"type": "json_object"})
+        except Exception:
+            try:
+                response = client.complete(**call_kwargs, temperature=0.1)
+            except Exception:
+                response = client.complete(**call_kwargs)
+
+    return response.choices[0].message.content or ""
 
 
-async def run_analyzer(workflow: str, indexer_output: dict, language: str = "en", custom_instructions: str = "") -> dict:
-    """Run the Analyzer agent on the Indexer's output via Foundry Agent Service."""
-    from agents import get_agent_id
+async def run_analyzer(workflow: str, indexer_output: dict, language: str = "en", custom_instructions: str = "", search_context: str = "") -> dict:
+    """Run the Analyzer via direct chat completions with Structured Outputs.
 
-    client = get_agents_client()
-    agent_id = get_agent_id("analyzer")
-
+    Uses response_format={'type': 'json_object'} to guarantee valid JSON.
+    When search_context is provided (from Azure AI Search facts index), the Analyzer
+    receives compact structured reference data plus focused retrieved context instead
+    of the full Indexer JSON dump. This preserves complete numbers and facts while
+    still reducing prompt size and improving speed and reliability.
+    Falls back to full JSON if search_context is empty.
+    """
     instructions = WORKFLOW_INSTRUCTIONS.get(workflow, WORKFLOW_INSTRUCTIONS["summary"])
 
     if language == "pl":
@@ -488,18 +519,291 @@ async def run_analyzer(workflow: str, indexer_output: dict, language: str = "en"
     if custom_instructions:
         instructions += f"\n\nUSER'S SPECIFIC INSTRUCTIONS: {custom_instructions}"
 
-    user_message = f"{instructions}\n\nIndexer output:\n\n{json.dumps(indexer_output, indent=2)}\n\nPerform your analysis now."
+    # Build the user message: focused context when available, full JSON as fallback
+    if search_context.strip():
+        # Build compact document metadata plus the complete structured numbers/facts block.
+        doc_summaries = _build_doc_summaries(indexer_output)
+        structured_reference = _build_structured_reference_data(indexer_output)
+        user_message = (
+            f"{instructions}\n\n"
+            f"Document summaries:\n{doc_summaries}\n\n"
+            f"Structured reference data (authoritative extracted sections, facts, and number registry). "
+            f"If a value appears here, treat it as present in the extracted document data and do not describe it as missing:\n"
+            f"{structured_reference}\n\n"
+            f"Relevant extracted data (retrieved via semantic search):\n{search_context}\n\n"
+            f"Perform your analysis now."
+        )
+        # Also include gap_rule_findings if present
+        gap_findings = indexer_output.get("gap_rule_findings")
+        if gap_findings:
+            user_message = (
+                f"{instructions}\n\n"
+                f"Document summaries:\n{doc_summaries}\n\n"
+                f"Structured reference data (authoritative extracted sections, facts, and number registry). "
+                f"If a value appears here, treat it as present in the extracted document data and do not describe it as missing:\n"
+                f"{structured_reference}\n\n"
+                f"Relevant extracted data (retrieved via semantic search):\n{search_context}\n\n"
+                f"Gap rule findings:\n{json.dumps(gap_findings, indent=1)}\n\n"
+                f"Perform your analysis now."
+            )
+    else:
+        user_message = f"{instructions}\n\nIndexer output:\n\n{json.dumps(indexer_output, indent=2)}\n\nPerform your analysis now."
 
-    # Run the blocking Foundry SDK call off the event loop
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, _call_analyzer_sync, client, agent_id, user_message)
+    # Run via direct chat completions with Structured Outputs
+    system_prompt = f"{BASE_INSTRUCTIONS}\n\n{instructions}"
+
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(None, _call_analyzer_sync, system_prompt, user_message)
 
     try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-    except json.JSONDecodeError as exc:
-        logger.warning("Analyzer returned non-JSON response: %s", exc)
+        parsed = _parse_json_robust(text)
+        if parsed is not None:
+            if workflow == "summary":
+                parsed = _ensure_summary_key_numbers(parsed, indexer_output)
+            return parsed
+    except Exception as exc:
+        logger.warning("Analyzer JSON parse failed: %s", exc)
 
+    logger.warning("Analyzer returned non-JSON. First 500 chars: %s", text[:500])
     return {"error": "Analyzer did not return valid JSON — please retry", "raw_output": text}
+
+
+def _parse_json_robust(text: str) -> dict | None:
+    """Parse JSON from model output, handling fences, extra data, and truncation."""
+    import re
+    # Strip markdown fences
+    stripped = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+    stripped = re.sub(r"\n?```\s*$", "", stripped)
+
+    start = stripped.find("{")
+    if start < 0:
+        return None
+
+    # Try from first { to last }
+    end = stripped.rfind("}") + 1
+    if end > start:
+        try:
+            return json.loads(stripped[start:end])
+        except json.JSONDecodeError:
+            pass
+
+    # "Extra data" case: find the end of the FIRST complete JSON object
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(stripped)):
+        c = stripped[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(stripped[start:i + 1])
+                except json.JSONDecodeError:
+                    break
+
+    # Truncation repair: close unmatched braces/brackets
+    candidate = stripped[start:end] if end > start else stripped[start:]
+    candidate = re.sub(r",\s*$", "", candidate)
+    open_b = candidate.count("{") - candidate.count("}")
+    open_sq = candidate.count("[") - candidate.count("]")
+    candidate += "]" * max(0, open_sq)
+    candidate += "}" * max(0, open_b)
+    try:
+        result = json.loads(candidate)
+        logger.info("Analyzer JSON repaired (closed %d braces, %d brackets)", open_b, open_sq)
+        return result
+    except json.JSONDecodeError:
+        pass
+
+    return None
+
+
+def _build_doc_summaries(indexer_output: dict) -> str:
+    """Build compact document metadata block for focused Analyzer prompts."""
+    parts: list[str] = []
+    for doc in indexer_output.get("documents", []):
+        source = doc.get("source_file", doc.get("title", "unknown"))
+        doc_type = doc.get("type", "other")
+        overview = doc.get("document_overview", "")
+        version = doc.get("version", "")
+        date = doc.get("date", "")
+        doc_num = doc.get("document_number", "")
+        section_count = len(doc.get("sections", []))
+        fact_count = len(doc.get("facts", []))
+        number_count = len(doc.get("number_registry", []))
+
+        summary = f"[{source}] type={doc_type}"
+        if version:
+            summary += f", version={version}"
+        if date:
+            summary += f", date={date}"
+        if doc_num:
+            summary += f", doc_number={doc_num}"
+        summary += f", sections={section_count}, facts={fact_count}, numbers={number_count}"
+        if overview:
+            summary += f"\n  Overview: {overview}"
+        parts.append(summary)
+
+    return "\n".join(parts) if parts else "(no documents)"
+
+
+def _build_structured_reference_data(indexer_output: dict) -> str:
+    """Build a compact but complete facts/numbers block for Analyzer prompts."""
+    parts: list[str] = []
+
+    for doc in indexer_output.get("documents", []):
+        source = doc.get("source_file", doc.get("title", "unknown"))
+        parts.append(f"[{source}]")
+
+        sections = doc.get("sections", [])
+        if sections:
+            parts.append("  Sections:")
+            for section_data in sections:
+                section_number = section_data.get("section_number", "")
+                heading = section_data.get("heading", "")
+                summary = section_data.get("summary", "")
+                quote = section_data.get("original_quote", "")
+                line = f"    - Section {section_number or '?'}"
+                if heading:
+                    line += f" | {heading}"
+                if summary:
+                    line += f" | Summary: {summary}"
+                if quote:
+                    line += f" | Quote: {quote}"
+                parts.append(line[:500])
+
+        facts = doc.get("facts", [])
+        if facts:
+            parts.append("  Facts:")
+            for fact in facts:
+                category = fact.get("category", "")
+                label = fact.get("label", "")
+                value = fact.get("value", "")
+                section = fact.get("section", "")
+                line = f"    - [{category}] {label} = {value}"
+                if section:
+                    line += f" (section: {section})"
+                parts.append(line[:300])
+
+        number_registry = doc.get("number_registry", [])
+        if number_registry:
+            parts.append("  Number registry:")
+            for number in number_registry:
+                value = number.get("value", "")
+                unit = number.get("unit", "")
+                context = number.get("context", "")
+                section = number.get("section", "")
+                line = f"    - {context or 'number'} = {value}"
+                if unit and unit.lower() not in str(value).lower():
+                    line += f" {unit}"
+                if section:
+                    line += f" (section: {section})"
+                parts.append(line[:300])
+
+    return "\n".join(parts) if parts else "(no structured reference data)"
+
+
+def _ensure_summary_key_numbers(parsed: dict, indexer_output: dict) -> dict:
+    """Ensure summary analyses carry forward material numeric clauses from the Indexer."""
+    analysis = parsed.get("analysis")
+    if not isinstance(analysis, dict):
+        return parsed
+
+    deterministic_numbers = _extract_summary_key_numbers(indexer_output)
+    if not deterministic_numbers:
+        return parsed
+
+    existing = analysis.get("key_numbers")
+    existing_list = existing if isinstance(existing, list) else []
+    seen = {
+        (
+            str(item.get("source_file", "")),
+            str(item.get("section", "")),
+            str(item.get("value", "")),
+        )
+        for item in existing_list
+        if isinstance(item, dict)
+    }
+
+    merged = list(existing_list)
+    for item in deterministic_numbers:
+        key = (item["source_file"], item["section"], item["value"])
+        if key not in seen:
+            merged.append(item)
+            seen.add(key)
+
+    analysis["key_numbers"] = merged
+    return parsed
+
+
+def _extract_summary_key_numbers(indexer_output: dict) -> list[dict]:
+    """Build a deterministic list of material numeric clauses for summary workflows."""
+    candidates: list[tuple[int, int, dict]] = []
+
+    for doc in indexer_output.get("documents", []):
+        source = doc.get("source_file", doc.get("title", "unknown"))
+        for section_data in doc.get("sections", []):
+            quote = str(section_data.get("original_quote", "")).strip()
+            if not quote or not re.search(r"\d", quote):
+                continue
+
+            section_number = str(section_data.get("section_number", "")).strip()
+            heading = str(section_data.get("heading", "")).strip() or f"Section {section_number or '?'}"
+            summary = str(section_data.get("summary", "")).strip()
+            score, importance = _score_summary_numeric_clause(heading, quote)
+            note = summary or "Explicit numeric clause extracted from the document."
+            sort_order = int(section_number) if section_number.isdigit() else 999
+
+            candidates.append((
+                score,
+                sort_order,
+                {
+                    "value": quote,
+                    "context": heading,
+                    "source_file": source,
+                    "section": heading,
+                    "importance": importance,
+                    "note": note,
+                },
+            ))
+
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]["context"]))
+
+    results: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for _, _, item in candidates:
+        key = (item["source_file"], item["section"], item["value"])
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append(item)
+        if len(results) >= 12:
+            break
+
+    return results
+
+
+def _score_summary_numeric_clause(heading: str, quote: str) -> tuple[int, str]:
+    """Rank numeric clauses so summary workflows keep the most material items first."""
+    text = f"{heading} {quote}".lower()
+
+    if any(token in text for token in ("fee", "price", "payment", "invoice", "amount", "cost", "rate")):
+        return 100, "HIGH"
+    if any(token in text for token in ("liability", "cap", "limit", "penalty", "damages")):
+        return 95, "HIGH"
+    if any(token in text for token in ("term", "duration", "period", "months", "days", "deadline", "effective date", "date")):
+        return 85, "MEDIUM"
+    return 60, "MEDIUM"

@@ -1,7 +1,8 @@
 """
 Agent 1 — Indexer & Fact Extractor
-Registered as a Foundry agent via Azure AI Agent Service SDK.
-Parses uploaded documents, extracts key facts, and produces a structured fact sheet.
+Uses direct chat completions via Azure AI Inference SDK for speed.
+Registered in Foundry for portal visibility, but runtime calls use
+single-shot chat completions instead of the Assistants API.
 
 For large documents (200+ pages), uses a chunked processing path:
 chunks are processed concurrently and fact sheets are merged with deduplication.
@@ -11,161 +12,61 @@ import asyncio
 import json
 import logging
 import os
+import re
 
-from azure.ai.agents.models import ListSortOrder
-
-from foundry_client import get_agents_client, get_indexer_model_name, run_with_retry
+from foundry_client import get_agents_client, get_indexer_model_name, get_inference_client
 
 logger = logging.getLogger("vigil.agents.indexer")
 
 INSTRUCTIONS = """\
-You are the **Indexer & Fact Extractor** agent, the first stage in a document analysis pipeline.
+You are the **Indexer** agent. Extract structured facts from documents into JSON.
 
-You receive the raw text content of one or more documents. Your job is to produce \
-a comprehensive, structured fact sheet that captures EVERYTHING in the document so that \
-downstream agents can perform comparison, compliance, and gap analysis without access \
-to the original text. Err on the side of extracting MORE rather than less.
+For each document extract:
+- Metadata: title, type, version, date, document_number, source_file (EXACT uploaded filename)
+- document_overview: 2-3 sentence description
+- sections: every section/article/clause with heading, section_number, summary (capture ALL key terms and values), original_quote (verbatim text)
+- facts: category (date|amount|party|obligation|kpi|identifier|reference), label, value, section
+- number_registry: EVERY number in the document — value, normalized_value, unit, context, section
 
-## 1. IDENTIFY EACH DOCUMENT
-Determine the document's type from its content. Common types include:
-  - **Contracts**: MSA, SOW, amendment, side letter, NDA/CDA, service agreement, lease, licensing
-  - **Financial**: invoice, credit note, purchase order, budget, cost estimate, financial report
-  - **Regulatory / Compliance**: filings, audit reports, certifications, policy documents
-  - **Technical**: specifications, protocols, test reports, design documents, SOPs
-  - **Commercial**: supply agreement, distribution agreement, proposals, quotations
-  - **HR & Corporate**: policy, employee agreement, benefits summary, org chart, memo
-  - **Other**: risk register, project plan, meeting minutes, correspondence
-Extract: title, version/revision, author, effective date, document number/ID, and any \
-other identifying metadata.
+The number_registry is CRITICAL — downstream agents use it for cross-document consistency checks.
+Section summaries must be detailed enough for section-by-section comparison.
 
-## 2. EXTRACT EVERY NUMBER AND DATA POINT
-This is your HIGHEST PRIORITY. Downstream agents depend on a COMPLETE inventory of every \
-quantitative value in the document. For EACH number you find, record:
-  - The exact value (preserve original formatting, currency, units)
-  - The context: what does this number represent?
-  - The section/clause where it appears
-  - The verbatim quote containing it
-
-Types of numerical data to capture — miss NOTHING:
-  - **Monetary values**: prices, fees, totals, subtotals, taxes, discounts, royalties, \
-penalties, unit prices, line item amounts, budgets, caps, milestone payments, hourly rates, \
-annual values, monthly values
-  - **Dates and deadlines**: effective dates, expiration dates, due dates, milestones, \
-notice periods ("30 days"), renewal periods, payment terms (Net 30, Net 60). \
-IMPORTANT: dates may appear in non-standard formats — handwritten, stamped, with extra spaces \
-(e.g. "2017 -11- 15"), different separators (dots, slashes, dashes), or regional formats \
-(DD.MM.YYYY, YYYY-MM-DD, Month DD YYYY, etc.). Normalize all dates to a readable format \
-in the `value` field but keep the exact original text in `original_quote`. Also look for \
-dates in headers, footers, stamps, and metadata fields (e.g. "Data obowiązywania", \
-"Effective date", "Issue date", "Revision date").
-  - **Quantities**: item counts, units, volumes, headcounts, page counts, hours, FTEs
-  - **Percentages**: tax rates, discount rates, markup, margin, escalation rates, \
-interest rates, SLA targets, penalties (% per day)
-  - **Thresholds and limits**: caps, minimums, maximums, ceilings, floors, not-to-exceed values
-  - **Identifiers with numbers**: invoice numbers, PO numbers, contract IDs, version numbers
-
-For financial documents (invoices, POs, budgets): extract EVERY line item with description, \
-quantity, unit price, line total, tax, and any applied discounts. Also extract subtotals, \
-tax totals, and grand totals. Verify that line item totals are arithmetically consistent.
-
-## 3. EXTRACT ALL OTHER KEY FACTS
-  - **Parties and identifiers**: company names, addresses, tax IDs, registration numbers, \
-contacts, signatories, roles
-  - **Obligations and commitments**: deliverables, SLAs, service levels, warranties, \
-payment terms, performance requirements, acceptance criteria
-  - **Definitions**: defined terms and their meanings (these often contain critical thresholds)
-  - **Conditions and triggers**: renewal conditions, termination triggers, escalation clauses
-  - **References**: references to other documents, laws, regulations, standards, exhibits, annexes
-
-## 4. MAP EVERY SECTION IN DETAIL
-List ALL sections/articles/clauses of each document. For each section provide:
-  - The heading/title using the document's OWN numbering (Article 3.2, §7, Annex A, etc.)
-  - A DETAILED summary that captures ALL key terms, values, conditions, obligations, and \
-specific language — not just a one-liner. Include every number that appears in that section.
-  - The verbatim original quote
-
-The section summaries are CRITICAL — downstream agents use them to compare documents \
-section-by-section. If a section summary is too brief, the comparison will miss changes.
-
-## 5. CAPTURE EXACT QUOTES
-For EVERY fact and EVERY section summary, include the `original_quote` field with the \
-EXACT text from the source document, verbatim, in the original language. This is \
-non-negotiable — it enables traceability.
-
-## OUTPUT FORMAT
-Return ONLY a JSON object (no markdown fences, no explanation):
+Return ONLY a JSON object (no markdown fences):
 {
   "documents": [
     {
       "doc_id": "doc-1",
-      "source_file": "the EXACT uploaded filename (e.g. 'Contract_v2.pdf')",
+      "source_file": "exact_filename.pdf",
       "title": "...",
-      "type": "contract|invoice|policy|nda|sow|budget|specification|protocol|regulatory|report|other",
-      "subtype": "e.g. purchase_order, credit_note, MSA, amendment, service_agreement, etc.",
+      "type": "contract|invoice|policy|sow|budget|specification|report|other",
       "version": "...",
-      "author": "...",
       "date": "...",
       "document_number": "...",
-      "document_overview": "A 3-5 sentence description of what this document is, its purpose, \
-the parties involved, the key commercial/legal/technical terms, and the time period it covers. \
-This overview must be detailed enough that a reader can understand the document without seeing it.",
+      "document_overview": "2-3 sentence description",
       "sections": [
-        {
-          "heading": "...",
-          "section_number": "Article 3.2, Section 5, §7, Annex A — use the document's own numbering",
-          "summary": "Detailed summary capturing ALL key terms, ALL numerical values, ALL conditions and obligations. \
-Include every number with its context.",
-          "original_quote": "Exact verbatim text (original language)"
-        }
+        {"heading": "...", "section_number": "...", "summary": "detailed summary with all values", "original_quote": "verbatim text"}
       ],
       "facts": [
-        {
-          "category": "date|amount|party|obligation|kpi|line_item|quantity|percentage|threshold|identifier|definition|reference",
-          "label": "descriptive label",
-          "value": "exact value from document",
-          "confidence": 0.0-1.0,
-          "section": "exact heading or article/clause number",
-          "original_quote": "exact verbatim quote (original language)"
-        }
+        {"category": "date|amount|party|obligation|kpi|identifier", "label": "...", "value": "...", "section": "..."}
       ],
       "number_registry": [
-        {
-          "value": "the exact number as it appears (e.g. '$185,000', '45 days', '10%', 'Net 30')",
-          "normalized_value": "numeric-only for comparison (e.g. 185000, 45, 0.10, 30)",
-          "unit": "USD|EUR|days|percent|units|hours|pages|FTE|other",
-          "context": "what this number represents — e.g. 'monthly service fee', 'payment deadline', 'late penalty rate'",
-          "section": "exact section/clause reference",
-          "original_quote": "exact verbatim sentence/clause containing this number"
-        }
-      ],
-      "extraction_confidence": {
-        "overall": 0.0-1.0,
-        "text_quality": "HIGH|MEDIUM|LOW",
-        "notes": "any issues (OCR errors, handwriting, blurry scan, truncated text, etc.)"
-      }
+        {"value": "exact number", "normalized_value": 0, "unit": "...", "context": "what it represents", "section": "..."}
+      ]
     }
   ]
 }
 
-## CONFIDENCE SCORING
-  - **0.9–1.0**: Explicitly and clearly stated, exact match with source text
-  - **0.7–0.89**: Minor interpretation needed (ambiguous date format, abbreviation)
-  - **0.5–0.69**: Partially stated or inferred from context
-  - **0.3–0.49**: Unclear — poor text quality, ambiguous wording, incomplete data
-  - **0.0–0.29**: Highly uncertain — guessed from degraded text
-
-## RULES
-- Extract ONLY facts explicitly stated in the document. If you must infer, confidence < 0.5.
-- The `source_file` field MUST be the exact uploaded filename from the input header.
-- The `section` field MUST reference a specific article, clause, or heading number.
-- The `original_quote` MUST be exact, unmodified text in the original language.
-- The `number_registry` MUST catalog EVERY number in the document — this is used by \
-downstream agents for cross-document number consistency analysis.
-- Be EXHAUSTIVE. It is better to extract too many facts than to miss any.
+RULES:
+- Extract only explicitly stated facts. Use exact values from the document.
+- source_file MUST match the exact uploaded filename.
+- Be exhaustive — it is better to extract too many facts than to miss any.
 """
 
 
 AGENT_NAME = "vigil-indexer"
+INDEXER_RETRY_ATTEMPTS = max(1, int(os.getenv("INDEXER_RETRY_ATTEMPTS", "2")))
+FALLBACK_MAX_NUMBERS = max(20, int(os.getenv("INDEXER_FALLBACK_MAX_NUMBERS", "200")))
+FALLBACK_QUOTE_MAX_CHARS = max(2000, int(os.getenv("INDEXER_FALLBACK_QUOTE_MAX_CHARS", "12000")))
 
 
 def ensure_indexer_agent() -> str:
@@ -176,32 +77,27 @@ def ensure_indexer_agent() -> str:
     model = get_indexer_model_name()
     existing_id = find_agent_by_name(AGENT_NAME)
     if existing_id:
-        client.update_agent(
-            agent_id=existing_id,
-            model=model,
-            instructions=INSTRUCTIONS,
-            temperature=0.1,
-        )
-        logger.info("Updated Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, existing_id)
+        try:
+            kwargs = dict(agent_id=existing_id, model=model, instructions=INSTRUCTIONS)
+            try:
+                client.update_agent(**kwargs, temperature=0.1)
+            except Exception:
+                client.update_agent(**kwargs)
+            logger.info("Updated Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, existing_id)
+        except Exception as exc:
+            logger.warning("Could not update agent '%s', using existing: %s", AGENT_NAME, exc)
         return existing_id
 
-    agent = client.create_agent(
-        model=model,
-        name=AGENT_NAME,
-        instructions=INSTRUCTIONS,
-        temperature=0.1,
-    )
+    try:
+        agent = client.create_agent(model=model, name=AGENT_NAME, instructions=INSTRUCTIONS, temperature=0.1)
+    except Exception:
+        agent = client.create_agent(model=model, name=AGENT_NAME, instructions=INSTRUCTIONS)
     logger.info("Created Foundry agent '%s' (model=%s): %s", AGENT_NAME, model, agent.id)
     return agent.id
 
 
 async def run_indexer(documents: list[dict], language: str = "en", custom_instructions: str = "") -> dict:
-    """Run the Indexer agent on a list of parsed documents via Foundry Agent Service."""
-    from agents import get_agent_id
-
-    client = get_agents_client()
-    agent_id = get_agent_id("indexer")
-
+    """Run the Indexer on a list of parsed documents via direct chat completions."""
     # Build document text
     doc_text = ""
     for i, doc in enumerate(documents, 1):
@@ -212,23 +108,25 @@ async def run_indexer(documents: list[dict], language: str = "en", custom_instru
     suffix = _build_lang_and_notes(language, custom_instructions)
     user_message = f"Extract and index the following documents:{suffix}\n{doc_text}"
 
-    # Run the blocking Foundry SDK call off the event loop
-    loop = asyncio.get_event_loop()
-    text = await loop.run_in_executor(None, _call_indexer_sync, client, agent_id, user_message)
+    # Single chat completion call with retry + robust JSON parsing
+    loop = asyncio.get_running_loop()
+    parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_sync, user_message)
 
-    # Parse JSON from response
-    try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            parsed = json.loads(text[start:end])
-            if "documents" in parsed:
-                return _ensure_all_confidence_scores(parsed)
-            return _ensure_all_confidence_scores({"documents": [parsed], "raw_output": text})
-    except json.JSONDecodeError as exc:
-        logger.warning("Indexer returned non-JSON response: %s", exc)
+    if parsed:
+        if "documents" in parsed:
+            return _ensure_all_confidence_scores(_normalize_indexer_documents(parsed, documents))
+        normalized = _normalize_single_doc_result(parsed, 1, documents[0].get("filename", "document-1"))
+        return _ensure_all_confidence_scores({"documents": [normalized], "raw_output": text})
 
-    return {"documents": [], "error": "Indexer did not return valid JSON — please retry"}
+    logger.warning("Indexer returned non-JSON. First 500 chars: %s", text[:500])
+    fallback_documents = [
+        _build_fallback_doc_result(i, doc.get("filename", f"document-{i}"), doc.get("content", ""))
+        for i, doc in enumerate(documents, 1)
+    ]
+    return _ensure_all_confidence_scores({
+        "documents": fallback_documents,
+        "warning": "Indexer returned non-JSON; used deterministic fallback extraction",
+    })
 
 
 # ─── Chunked processing for large documents ───────────────────
@@ -236,18 +134,29 @@ async def run_indexer(documents: list[dict], language: str = "en", custom_instru
 MAX_CONCURRENT_CHUNKS = int(os.getenv("MAX_CONCURRENT_CHUNKS", "5"))
 
 
-def _call_indexer_sync(client, agent_id: str, user_message: str) -> str:
-    """Synchronous Foundry Indexer call — runs in a thread-pool executor for true parallelism."""
-    thread = client.threads.create()
-    client.messages.create(thread_id=thread.id, role="user", content=user_message)
-    run = run_with_retry(client.runs.create_and_process, thread_id=thread.id, agent_id=agent_id)
-    if run.status == "failed":
-        raise RuntimeError(f"Indexer run failed: {run.last_error}")
-    messages = client.messages.list(thread_id=thread.id, order=ListSortOrder.ASCENDING)
-    for msg in messages:
-        if msg.role == "assistant" and msg.text_messages:
-            return msg.text_messages[-1].text.value
-    return ""
+def _call_indexer_sync(user_message: str) -> str:
+    """Synchronous chat completion call — runs in a thread-pool executor.
+
+    Uses the Azure AI Inference SDK for a single HTTP call instead of the
+    Agent Service's thread/message/run pattern (4-5 round-trips).
+    """
+    from azure.ai.inference.models import SystemMessage, UserMessage
+
+    model = get_indexer_model_name()
+    client = get_inference_client(model)
+
+    call_kwargs = dict(
+        messages=[
+            SystemMessage(content=INSTRUCTIONS),
+            UserMessage(content=user_message),
+        ],
+    )
+    try:
+        response = client.complete(**call_kwargs, temperature=0.1)
+    except Exception:
+        response = client.complete(**call_kwargs)
+
+    return response.choices[0].message.content or ""
 
 
 def _build_lang_and_notes(language: str, custom_instructions: str) -> str:
@@ -265,29 +174,135 @@ def _build_lang_and_notes(language: str, custom_instructions: str) -> str:
 
 
 def _parse_indexer_json(text: str) -> dict | None:
-    """Try to parse a JSON object from the Indexer's text response."""
+    """Parse JSON from model output, handling fences, extra data, and truncation."""
+    import re
+    stripped = re.sub(r"^```(?:json)?\s*\n?", "", text.strip())
+    stripped = re.sub(r"\n?```\s*$", "", stripped)
+
+    start = stripped.find("{")
+    if start < 0:
+        return None
+
+    end = stripped.rfind("}") + 1
+    if end > start:
+        try:
+            return json.loads(stripped[start:end])
+        except json.JSONDecodeError:
+            pass
+
+    # Find end of first complete JSON object
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(stripped)):
+        c = stripped[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_string:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(stripped[start:i + 1])
+                except json.JSONDecodeError:
+                    break
+
+    # Truncation repair
+    candidate = stripped[start:end] if end > start else stripped[start:]
+    candidate = re.sub(r",\s*$", "", candidate)
+    open_b = candidate.count("{") - candidate.count("}")
+    open_sq = candidate.count("[") - candidate.count("]")
+    candidate += "]" * max(0, open_sq)
+    candidate += "}" * max(0, open_b)
     try:
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
+        result = json.loads(candidate)
+        logger.info("Indexer JSON repaired (closed %d braces, %d brackets)", open_b, open_sq)
+        return result
     except json.JSONDecodeError:
         pass
+
     return None
 
 
-async def run_indexer_parallel(documents: list[dict], language: str = "en", custom_instructions: str = "") -> dict:
-    """Process multiple documents concurrently — each in its own Indexer thread.
+def _call_and_parse_indexer_sync(user_message: str) -> tuple[dict | None, str]:
+    """Call the Indexer model and parse JSON with targeted retries on malformed output."""
+    last_text = ""
 
-    Each document gets an independent Foundry API call via the thread-pool executor,
+    for attempt in range(1, INDEXER_RETRY_ATTEMPTS + 1):
+        attempt_message = user_message
+        if attempt > 1:
+            attempt_message += (
+                "\n\nIMPORTANT RETRY INSTRUCTION: The previous response was not valid JSON. "
+                "Return ONLY a single valid JSON object matching the required schema. "
+                "Do not include markdown code fences, prose, or trailing text."
+            )
+
+        last_text = _call_indexer_sync(attempt_message)
+        parsed = _parse_indexer_json(last_text)
+        if parsed is not None:
+            if attempt > 1:
+                logger.info("Indexer JSON recovered on retry attempt %d", attempt)
+            return parsed, last_text
+
+        logger.warning("Indexer returned non-JSON on attempt %d/%d", attempt, INDEXER_RETRY_ATTEMPTS)
+
+    return None, last_text
+
+
+def _normalize_single_doc_result(doc_result: dict, doc_idx: int, filename: str) -> dict:
+    """Normalize a single Indexer document object to expected structural fields."""
+    normalized = dict(doc_result or {})
+    normalized["doc_id"] = f"doc-{doc_idx}"
+    normalized["source_file"] = filename
+    normalized.setdefault("title", filename)
+    normalized.setdefault("type", "other")
+    normalized.setdefault("sections", [])
+    normalized.setdefault("facts", [])
+    normalized.setdefault("number_registry", [])
+    normalized.setdefault("document_overview", "")
+    return normalized
+
+
+def _normalize_indexer_documents(indexer_json: dict, input_documents: list[dict]) -> dict:
+    """Normalize model-returned documents and bind them to canonical uploaded filenames."""
+    docs = indexer_json.get("documents", [])
+    normalized_docs: list[dict] = []
+
+    for idx, source_doc in enumerate(input_documents, 1):
+        filename = source_doc.get("filename", f"document-{idx}")
+        doc_result = docs[idx - 1] if idx - 1 < len(docs) and isinstance(docs[idx - 1], dict) else {}
+        normalized_docs.append(_normalize_single_doc_result(doc_result, idx, filename))
+
+    # Preserve any extra model docs, but label them as extras to avoid silent data loss.
+    for extra_idx in range(len(input_documents), len(docs)):
+        extra = docs[extra_idx]
+        if isinstance(extra, dict):
+            normalized_docs.append(
+                _normalize_single_doc_result(extra, extra_idx + 1, f"extra-document-{extra_idx + 1}")
+            )
+
+    return {**indexer_json, "documents": normalized_docs}
+
+
+async def run_indexer_parallel(documents: list[dict], language: str = "en", custom_instructions: str = "") -> dict:
+    """Process multiple documents concurrently via direct chat completions.
+
+    Each document gets an independent chat completion call via the thread-pool executor,
     enabling true parallelism (up to MAX_CONCURRENT_CHUNKS concurrent calls).
     Large individual documents (>15K words) are auto-chunked internally.
     """
-    from agents import get_agent_id
     from chunker import chunk_document, LARGE_DOC_THRESHOLD
 
-    client = get_agents_client()
-    agent_id = get_agent_id("indexer")
     sem = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
     suffix = _build_lang_and_notes(language, custom_instructions)
 
@@ -301,7 +316,7 @@ async def run_indexer_parallel(documents: list[dict], language: str = "en", cust
             chunks = chunk_document(content)
             logger.info("[parallel] Doc %d '%s': %d words → %d chunks", doc_idx, filename, word_count, len(chunks))
             tasks = [
-                _process_single_chunk(client, agent_id, sem, chunk, filename, doc_idx, len(chunks), language, custom_instructions)
+                _process_single_chunk(sem, chunk, filename, doc_idx, len(chunks), language, custom_instructions)
                 for chunk in chunks
             ]
             chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -311,27 +326,23 @@ async def run_indexer_parallel(documents: list[dict], language: str = "en", cust
                     logger.error("[parallel] Doc %d chunk %d failed: %s", doc_idx, i + 1, r)
             return _merge_chunk_facts(valid, doc_idx, filename)
 
-        # Small/medium doc → single Indexer call
+        # Small/medium doc → single chat completion call
         async with sem:
             logger.info("[parallel] Doc %d '%s': %d words", doc_idx, filename, word_count)
             user_message = (
                 f"Extract and index the following document:{suffix}\n\n"
                 f"{'=' * 60}\nDOCUMENT {doc_idx}: {filename}\n{'=' * 60}\n{content}"
             )
-            loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, _call_indexer_sync, client, agent_id, user_message)
-
-            parsed = _parse_indexer_json(text)
+            loop = asyncio.get_running_loop()
+            parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_sync, user_message)
             if parsed:
                 if "documents" in parsed and parsed["documents"]:
-                    doc_result = parsed["documents"][0]
-                    doc_result["doc_id"] = f"doc-{doc_idx}"
+                    doc_result = _normalize_single_doc_result(parsed["documents"][0], doc_idx, filename)
                     return doc_result
-                parsed["doc_id"] = f"doc-{doc_idx}"
-                return parsed
+                return _normalize_single_doc_result(parsed, doc_idx, filename)
 
-            logger.warning("[parallel] Doc %d '%s' returned non-JSON", doc_idx, filename)
-            return {"doc_id": f"doc-{doc_idx}", "title": filename, "type": "other", "sections": [], "facts": []}
+            logger.warning("[parallel] Doc %d '%s' returned non-JSON after retries", doc_idx, filename)
+            return _build_fallback_doc_result(doc_idx, filename, content)
 
     tasks = [_handle_doc(i, doc) for i, doc in enumerate(documents, 1)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -351,11 +362,8 @@ async def run_indexer_parallel(documents: list[dict], language: str = "en", cust
 
 async def run_indexer_chunked(documents: list[dict], language: str = "en", custom_instructions: str = "") -> dict:
     """Process large documents by chunking, extracting facts concurrently, and merging results."""
-    from agents import get_agent_id
     from chunker import chunk_document
 
-    client = get_agents_client()
-    agent_id = get_agent_id("indexer")
     sem = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
 
     all_doc_results = []
@@ -369,7 +377,7 @@ async def run_indexer_chunked(documents: list[dict], language: str = "en", custo
         logger.info("[chunked] Processing '%s': %d words → %d chunks", filename, len(content.split()), total_chunks)
 
         tasks = [
-            _process_single_chunk(client, agent_id, sem, chunk, filename, doc_idx, total_chunks, language, custom_instructions)
+            _process_single_chunk(sem, chunk, filename, doc_idx, total_chunks, language, custom_instructions)
             for chunk in chunks
         ]
         chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -387,8 +395,8 @@ async def run_indexer_chunked(documents: list[dict], language: str = "en", custo
     return _ensure_all_confidence_scores({"documents": all_doc_results})
 
 
-async def _process_single_chunk(client, agent_id, sem, chunk, filename, doc_idx, total_chunks, language, custom_instructions):
-    """Extract facts from a single document chunk via the Indexer agent."""
+async def _process_single_chunk(sem, chunk, filename, doc_idx, total_chunks, language, custom_instructions):
+    """Extract facts from a single document chunk via direct chat completions."""
     async with sem:
         lang_instruction = ""
         if language == "pl":
@@ -408,27 +416,35 @@ async def _process_single_chunk(client, agent_id, sem, chunk, filename, doc_idx,
             f"{'=' * 60}\nCHUNK {chunk['index'] + 1}/{total_chunks}: {filename}\n{'=' * 60}\n{chunk['content']}"
         )
 
-        loop = asyncio.get_event_loop()
-        text = await loop.run_in_executor(None, _call_indexer_sync, client, agent_id, user_message)
+        loop = asyncio.get_running_loop()
+        parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_sync, user_message)
+        if parsed:
+            if "documents" in parsed:
+                normalized = []
+                for i, raw_doc in enumerate(parsed.get("documents", []), 1):
+                    if isinstance(raw_doc, dict):
+                        normalized.append(_normalize_single_doc_result(raw_doc, doc_idx, filename))
+                return {**parsed, "documents": normalized}
+            return {"documents": [_normalize_single_doc_result(parsed, doc_idx, filename)]}
 
-        try:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                parsed = json.loads(text[start:end])
-                if "documents" in parsed:
-                    return parsed
-                return {"documents": [parsed]}
-        except json.JSONDecodeError as exc:
-            logger.warning("[chunked] Chunk %d returned non-JSON: %s", chunk["index"] + 1, exc)
-
-        return {"documents": []}
+        logger.warning("[chunked] Chunk %d returned non-JSON after retries", chunk["index"] + 1)
+        fallback_doc = _build_fallback_doc_result(
+            doc_idx,
+            filename,
+            chunk.get("content", ""),
+            doc_id=f"doc-{doc_idx}-chunk-{chunk['index'] + 1}",
+        )
+        fallback_doc["document_overview"] = (
+            f"Fallback extraction for chunk {chunk['index'] + 1}/{total_chunks} due to malformed model output."
+        )
+        return {"documents": [fallback_doc], "raw_output": text}
 
 
 def _merge_chunk_facts(chunk_results: list[dict], doc_idx: int, filename: str) -> dict:
     """Merge fact sheets from multiple chunks into one unified document fact sheet."""
     merged: dict = {
         "doc_id": f"doc-{doc_idx}",
+        "source_file": filename,
         "title": "",
         "type": "other",
         "version": "",
@@ -488,6 +504,105 @@ def _merge_chunk_facts(chunk_results: list[dict], doc_idx: int, filename: str) -
     )
     _ensure_confidence_scores(merged)
     return merged
+
+
+def _build_fallback_doc_result(doc_idx: int, filename: str, content: str, doc_id: str | None = None) -> dict:
+    """Build a deterministic fallback doc result when model JSON extraction fails."""
+    normalized_content = content or ""
+    excerpt = " ".join(normalized_content.strip().split())
+    excerpt = excerpt[:450] + ("..." if len(excerpt) > 450 else "")
+
+    numbers = _extract_number_registry_from_text(normalized_content, max_items=FALLBACK_MAX_NUMBERS)
+    facts = [
+        {
+            "category": "number",
+            "label": n.get("context", "Detected numeric value")[:120],
+            "value": n.get("value", ""),
+            "section": n.get("section", "Extracted text"),
+            "original_quote": n.get("original_quote", ""),
+            "confidence": 0.45,
+        }
+        for n in numbers[:120]
+    ]
+
+    quote = normalized_content[:FALLBACK_QUOTE_MAX_CHARS]
+    return {
+        "doc_id": doc_id or f"doc-{doc_idx}",
+        "source_file": filename,
+        "title": filename,
+        "type": "other",
+        "version": "",
+        "author": "",
+        "date": "",
+        "document_overview": (
+            "Fallback deterministic extraction was used because the model response was malformed. "
+            "Review source quotes for validation."
+        ),
+        "sections": [
+            {
+                "section_number": "1",
+                "heading": "Extracted text snapshot",
+                "summary": excerpt or "No extractable text content.",
+                "original_quote": quote,
+            }
+        ],
+        "facts": facts,
+        "number_registry": numbers,
+    }
+
+
+def _extract_number_registry_from_text(text: str, max_items: int = 200) -> list[dict]:
+    """Deterministically extract numeric evidence from raw text for fallback mode."""
+    if not text:
+        return []
+
+    # Matches integers/decimals with optional thousands separators and optional trailing %.
+    number_pattern = re.compile(r"(?<![\w-])(\d{1,3}(?:[\s\u00A0.,']\d{3})*(?:[.,]\d+)?%?|\d+(?:[.,]\d+)?%?)(?![\w-])")
+    unit_pattern = re.compile(r"^(mg|g|kg|mcg|ml|l|cm|mm|%|pln|eur|usd|gbp|days?|months?|years?)$", re.IGNORECASE)
+
+    registry: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    for match in number_pattern.finditer(text):
+        raw = match.group(1).strip()
+        if not raw:
+            continue
+
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(text)
+        line_text = " ".join(text[line_start:line_end].split())
+
+        snippet_start = max(0, match.start() - 50)
+        snippet_end = min(len(text), match.end() + 50)
+        snippet = " ".join(text[snippet_start:snippet_end].split())
+
+        key = (raw.lower(), line_text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        tail = text[match.end(): min(len(text), match.end() + 12)].strip().split()
+        unit = "%" if raw.endswith("%") else ""
+        if not unit and tail:
+            candidate = re.sub(r"[^a-zA-Z%]", "", tail[0])
+            if unit_pattern.match(candidate):
+                unit = candidate.lower()
+
+        registry.append({
+            "value": raw,
+            "unit": unit,
+            "context": line_text[:200] if line_text else snippet[:200],
+            "section": "Extracted text",
+            "original_quote": snippet[:260],
+            "confidence": 0.4,
+        })
+
+        if len(registry) >= max_items:
+            break
+
+    return registry
 
 
 # ─── Confidence scoring post-processing ───────────────────────

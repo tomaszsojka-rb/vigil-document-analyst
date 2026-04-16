@@ -1,27 +1,24 @@
 """
 Shared Azure AI Foundry client for Vigil agents.
 
-Provides a singleton AgentsClient authenticated via DefaultAzureCredential.
-All three pipeline agents (Indexer, Analyzer, Advisor) share this client
-for runtime operations: creating agents, threads, messages, and runs.
+Provides two client singletons:
+- AgentsClient: used at startup for agent registration (create/update/list)
+- ChatCompletionsClient (per-model): used at runtime for all LLM calls
 
-Includes retry helpers for rate-limit errors (HTTP 429) so parallel
-document processing gracefully handles transient quota exhaustion.
+Both authenticate via DefaultAzureCredential (Entra ID).
 """
 
 import logging
 import os
-import time
 
 from azure.ai.agents import AgentsClient
+from azure.ai.inference import ChatCompletionsClient
 from azure.identity import DefaultAzureCredential
 
 logger = logging.getLogger("vigil.foundry_client")
 
 _agents_client: AgentsClient | None = None
-
-MAX_RETRIES = int(os.getenv("FOUNDRY_MAX_RETRIES", "4"))
-INITIAL_BACKOFF = float(os.getenv("FOUNDRY_INITIAL_BACKOFF", "15"))  # seconds
+_inference_clients: dict[str, ChatCompletionsClient] = {}
 
 
 def _get_endpoint() -> str:
@@ -30,6 +27,26 @@ def _get_endpoint() -> str:
     if not endpoint:
         raise ValueError("FOUNDRY_PROJECT_ENDPOINT must be set to your Foundry project endpoint")
     return endpoint
+
+
+def get_cognitive_endpoint() -> str:
+    """Return the base cognitive endpoint used by inference and OCR clients.
+
+    Checks AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT first (explicit override),
+    then derives from FOUNDRY_PROJECT_ENDPOINT by stripping /api/projects/<id>.
+    """
+    endpoint = os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "")
+    if endpoint:
+        return endpoint.rstrip("/")
+    # Derive from Foundry project endpoint
+    foundry = _get_endpoint().rstrip("/")
+    idx = foundry.find("/api/projects/")
+    if idx > 0:
+        return foundry[:idx]
+    raise ValueError(
+        "Cannot determine cognitive services endpoint. Set AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT "
+        "or ensure FOUNDRY_PROJECT_ENDPOINT contains '/api/projects/'."
+    )
 
 
 def get_agents_client() -> AgentsClient:
@@ -50,6 +67,32 @@ def get_agents_client() -> AgentsClient:
     return _agents_client
 
 
+def get_inference_client(model: str | None = None) -> ChatCompletionsClient:
+    """Return a ChatCompletionsClient for a specific model deployment (cached per model).
+
+    The Azure AI Inference SDK requires per-deployment endpoints:
+      https://<resource>.cognitiveservices.azure.com/openai/deployments/<model>
+
+    Used by all three agents (Indexer, Analyzer, Advisor) and Chat —
+    supports any model via single HTTP call per request.
+    """
+    if model is None:
+        model = get_model_name()
+    if model in _inference_clients:
+        return _inference_clients[model]
+
+    base = get_cognitive_endpoint()
+    endpoint = f"{base}/openai/deployments/{model}"
+    client = ChatCompletionsClient(
+        endpoint=endpoint,
+        credential=DefaultAzureCredential(),
+        credential_scopes=["https://cognitiveservices.azure.com/.default"],
+    )
+    _inference_clients[model] = client
+    logger.info("ChatCompletionsClient initialized for model '%s' at %s", model, endpoint)
+    return client
+
+
 def get_model_name() -> str:
     """Return the configured model deployment name (default: gpt-4.1)."""
     return os.getenv("FOUNDRY_MODEL_DEPLOYMENT_NAME", "gpt-4.1")
@@ -68,39 +111,3 @@ def get_analyzer_model_name() -> str:
 def get_advisor_model_name() -> str:
     """Return the model for the Advisor agent (default: gpt-4.1 for report quality)."""
     return os.getenv("FOUNDRY_ADVISOR_MODEL", get_model_name())
-
-
-def _is_rate_limit(exc: Exception) -> bool:
-    """Check if an exception (or an agent run error) is a rate-limit error."""
-    msg = str(exc).lower()
-    return "rate_limit" in msg or "429" in msg or "retry after" in msg
-
-
-def run_with_retry(fn, *args, **kwargs):
-    """Call *fn* with retry-and-backoff on rate-limit errors (synchronous).
-
-    Used for blocking Foundry SDK calls like ``client.runs.create_and_process``.
-    """
-    last_exc = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            result = fn(*args, **kwargs)
-            # Agent runs return a run object — check if it failed with a rate limit
-            if hasattr(result, "status") and result.status == "failed":
-                error_str = str(getattr(result, "last_error", ""))
-                if _is_rate_limit(Exception(error_str)):
-                    backoff = INITIAL_BACKOFF * (2 ** (attempt - 1))
-                    logger.warning("Rate limit on attempt %d/%d, retrying in %.0fs …", attempt, MAX_RETRIES, backoff)
-                    time.sleep(backoff)
-                    last_exc = RuntimeError(f"Rate limited: {error_str}")
-                    continue
-            return result
-        except Exception as exc:
-            if _is_rate_limit(exc) and attempt < MAX_RETRIES:
-                backoff = INITIAL_BACKOFF * (2 ** (attempt - 1))
-                logger.warning("Rate limit on attempt %d/%d, retrying in %.0fs …", attempt, MAX_RETRIES, backoff)
-                time.sleep(backoff)
-                last_exc = exc
-            else:
-                raise
-    raise last_exc or RuntimeError("Exhausted retries due to rate limiting")

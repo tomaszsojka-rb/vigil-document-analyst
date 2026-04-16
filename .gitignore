@@ -18,6 +18,7 @@ build/
 .idea/
 *.swp
 *.swo
+.ruff_cache/
 
 # OS
 .DS_Store

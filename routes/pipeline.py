@@ -18,10 +18,13 @@ from agents.indexer import run_indexer, run_indexer_chunked, run_indexer_paralle
 from agents.analyzer import run_analyzer
 from agents.advisor import run_advisor_streaming
 from routes import (
+    DOCUMENT_ID_PATTERN,
     VALID_WORKFLOWS,
     VALID_LANGUAGES,
     MAX_MESSAGE_LENGTH,
     JOB_ID_PATTERN,
+    cleanup_expired_upload_sessions,
+    get_upload_documents,
     jobs,
     cleanup_expired_jobs,
 )
@@ -35,12 +38,15 @@ async def handle_run(request: web.Request) -> web.Response:
     """Start a 3-agent workflow pipeline. Returns a job ID for SSE progress."""
     body = await request.json()
     workflow = body.get("workflow", "summary")
-    documents = body.get("documents", [])
+    upload_id = str(body.get("upload_id", "")).strip()
+    document_ids = body.get("document_ids", [])
     language = body.get("language", "en")
     custom_instructions = body.get("custom_instructions", "")
 
-    if not documents:
-        return web.json_response({"error": "No documents provided"}, status=400)
+    if not upload_id or not JOB_ID_PATTERN.match(upload_id):
+        return web.json_response({"error": "Invalid or missing upload session ID"}, status=400)
+    if document_ids is not None and not isinstance(document_ids, list):
+        return web.json_response({"error": "document_ids must be a list"}, status=400)
     if workflow not in VALID_WORKFLOWS:
         return web.json_response({"error": f"Invalid workflow: {workflow}"}, status=400)
     if language not in VALID_LANGUAGES:
@@ -48,11 +54,23 @@ async def handle_run(request: web.Request) -> web.Response:
     if len(custom_instructions) > MAX_MESSAGE_LENGTH:
         return web.json_response({"error": "Custom instructions too long"}, status=400)
 
+    for document_id in document_ids:
+        if not isinstance(document_id, str) or not DOCUMENT_ID_PATTERN.match(document_id):
+            return web.json_response({"error": "Invalid document ID format"}, status=400)
+
     cleanup_expired_jobs()
+    cleanup_expired_upload_sessions()
+
+    documents = get_upload_documents(upload_id, document_ids or None)
+    if documents is None:
+        return web.json_response({"error": "Upload session expired. Please upload your files again."}, status=410)
+    if not documents:
+        return web.json_response({"error": "No documents selected for analysis"}, status=400)
 
     job_id = str(uuid.uuid4())[:12]
     jobs[job_id] = {
         "status": "running",
+        "upload_id": upload_id,
         "workflow": workflow,
         "language": language,
         "custom_instructions": custom_instructions,
@@ -90,18 +108,16 @@ async def _run_pipeline(job_id: str, workflow: str, documents: list[dict], langu
             total_words = sum(len(d.get("content", "").split()) for d in documents)
             logger.info("[%s] Stage 1: Indexer starting PARALLEL (%d docs, %d words)", job_id, len(documents), total_words)
             indexer_result = await run_indexer_parallel(documents, language=language, custom_instructions=custom_instructions)
-            # Best-effort: index chunks in Search for follow-up chat RAG (if any doc is large)
-            if chunked:
-                _try_index_chunks_in_search(job_id, documents)
         elif chunked:
             total_words = sum(len(d.get("content", "").split()) for d in documents)
             logger.info("[%s] Stage 1: Indexer starting CHUNKED (%d docs, %d words)", job_id, len(documents), total_words)
             indexer_result = await run_indexer_chunked(documents, language=language, custom_instructions=custom_instructions)
-            # Best-effort: index chunks in Search for follow-up chat RAG
-            _try_index_chunks_in_search(job_id, documents)
         else:
             logger.info("[%s] Stage 1: Indexer starting (%d docs)", job_id, len(documents))
             indexer_result = await run_indexer(documents, language=language, custom_instructions=custom_instructions)
+
+        # Always index document chunks in Search for RAG (chat can query raw text)
+        _try_index_chunks_in_search(job_id, documents)
 
         job["stages"][-1]["status"] = "done"
         job["stages"][-1]["output"] = indexer_result
@@ -112,6 +128,9 @@ async def _run_pipeline(job_id: str, workflow: str, documents: list[dict], langu
         if indexer_result.get("error") or not indexer_result.get("documents"):
             error_msg = indexer_result.get("error", "Indexer returned no documents")
             raise RuntimeError(f"Indexer failed: {error_msg}")
+
+        # ── Index facts in Azure AI Search (enables focused Analyzer context) ──
+        _try_index_facts_in_search(job_id, indexer_result)
 
         # ── Gap Analysis Rules (pre-Analyzer) ──
         # For compliance_check and document_pack workflows, evaluate YAML DSL rules
@@ -138,7 +157,15 @@ async def _run_pipeline(job_id: str, workflow: str, documents: list[dict], langu
         job["stages"].append({"agent": "Analyzer", "status": "running", "output": None})
         logger.info("[%s] Stage 2: Analyzer starting (workflow=%s)", job_id, workflow)
 
-        analyzer_result = await run_analyzer(workflow, indexer_result, language=language, custom_instructions=custom_instructions)
+        # Build focused context from Search index (falls back to full JSON if unavailable)
+        search_context = _try_build_analyzer_context(job_id, workflow, indexer_result, custom_instructions)
+
+        analyzer_result = await run_analyzer(
+            workflow, indexer_result,
+            language=language,
+            custom_instructions=custom_instructions,
+            search_context=search_context,
+        )
         job["stages"][-1]["status"] = "done"
         job["stages"][-1]["output"] = analyzer_result
         logger.info("[%s] Stage 2: Analyzer done", job_id)
@@ -153,7 +180,7 @@ async def _run_pipeline(job_id: str, workflow: str, documents: list[dict], langu
         logger.info("[%s] Stage 3: Advisor starting (streaming)", job_id)
 
         job["advisor_streaming"] = True
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             full_text = await loop.run_in_executor(
                 None,
@@ -213,6 +240,34 @@ def _try_index_chunks_in_search(job_id: str, documents: list[dict]) -> None:
             index_document_chunks(chunks, job_id, f"doc-{i}", doc.get("filename", f"document-{i}"))
     except Exception as exc:
         logger.warning("Chunk indexing in Search skipped: %s", exc)
+
+
+def _try_index_facts_in_search(job_id: str, indexer_result: dict) -> None:
+    """Best-effort: index structured facts from Indexer output into Azure AI Search."""
+    try:
+        from search_client import ensure_facts_index, index_facts
+
+        if not ensure_facts_index():
+            return
+
+        count = index_facts(indexer_result, job_id)
+        if count:
+            logger.info("[%s] Indexed %d facts/sections in Search", job_id, count)
+    except Exception as exc:
+        logger.warning("[%s] Facts indexing in Search skipped: %s", job_id, exc)
+
+
+def _try_build_analyzer_context(job_id: str, workflow: str, indexer_result: dict, custom_instructions: str) -> str:
+    """Best-effort: build focused Analyzer context from Search facts index."""
+    try:
+        from search_client import build_analyzer_context
+        context = build_analyzer_context(job_id, workflow, indexer_result, custom_instructions)
+        if context:
+            logger.info("[%s] Built focused Analyzer context from Search (%d chars)", job_id, len(context))
+        return context
+    except Exception as exc:
+        logger.warning("[%s] Analyzer Search context skipped (using full JSON): %s", job_id, exc)
+        return ""
 
 
 # ─── SSE stream ───────────────────────────────────────────────

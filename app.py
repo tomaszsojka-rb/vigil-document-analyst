@@ -14,6 +14,7 @@ load_dotenv(override=False)
 
 from agents import ensure_agents
 from middleware import security_headers_middleware
+from routes import MAX_REQUEST_SIZE_BYTES
 from routes.upload import handle_upload
 from routes.pipeline import handle_run, handle_job_status, handle_job_stream
 from routes.chat import handle_chat
@@ -26,8 +27,6 @@ logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(l
 logging.getLogger("azure.identity").setLevel(logging.WARNING)
 
 STATIC_DIR = Path(__file__).parent / "static"
-UPLOAD_DIR = Path(__file__).parent / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
 PORT = int(os.getenv("VIGIL_PORT", "3000"))
 
 
@@ -54,7 +53,7 @@ async def on_shutdown(app: web.Application):
 
 def create_app() -> web.Application:
     app = web.Application(
-        client_max_size=50 * 1024 * 1024,  # 50MB upload limit
+        client_max_size=MAX_REQUEST_SIZE_BYTES,
         middlewares=[security_headers_middleware],
     )
     app.on_startup.append(on_startup)
@@ -65,6 +64,9 @@ def create_app() -> web.Application:
     app.router.add_get("/api/job/{job_id}", handle_job_status)
     app.router.add_get("/api/job/{job_id}/stream", handle_job_stream)
     app.router.add_post("/api/chat", handle_chat)
+    # CORS preflight for cross-origin deployments
+    from middleware import handle_cors_preflight
+    app.router.add_route("OPTIONS", "/api/{path:.*}", handle_cors_preflight)
     app.router.add_static("/static", STATIC_DIR)
     return app
 

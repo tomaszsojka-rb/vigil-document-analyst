@@ -5,6 +5,7 @@
 let currentStep = 0;
 let selectedWorkflow = null;
 let uploadedDocuments = [];
+let currentUploadId = null;
 let currentJobId = null;
 let currentLang = localStorage.getItem("vigil-lang") || "en";
 let chatHistory = [];
@@ -87,23 +88,23 @@ const T = {
     agent_modal: {
       indexer: {
         title: "Agent 1 — Indexer & Fact Extractor",
-        biz: "The Indexer is the foundation of every analysis. It converts unstructured document content (contracts, policies, spreadsheets) into a structured, machine-readable format. This removes the manual effort of reading through lengthy documents and ensures every downstream agent works from the same factual base — eliminating interpretation drift.",
-        tech: "Receives extracted content (text and tables) from PDF, DOCX, TXT, XLSX files, and scanned images (PNG, JPG, TIFF, BMP) via the document parser. The parser uses Python libraries (PyMuPDF, python-docx, openpyxl) for text-based formats and Azure AI Document Intelligence OCR for scanned documents and images. Runs as a persistent agent in Azure AI Foundry Agent Service. For small documents (≤30 pages), the full text is sent in a single call. For large documents (200+ pages), the text is automatically split into ~4,000-word chunks that are processed concurrently (up to 3 in parallel), then the extracted facts are merged with deduplication. If Azure AI Search is configured, chunks are indexed for follow-up chat RAG. Extracts: document metadata (title, type, version, author, date), section headings with summaries, structured facts categorized as date, amount, party, obligation, or KPI, and exact verbatim quotes (original_quote) from the source document for traceability.",
-        how: ["Receives parsed text from all uploaded documents", "For large docs: automatically splits into ~4,000-word overlapping chunks", "Processes chunks concurrently (max 3 parallel) via separate agent threads", "Merges chunk results into a unified fact sheet with deduplication", "Optionally indexes chunks in Azure AI Search for follow-up chat RAG", "Outputs a structured JSON fact sheet per document with original_quote fields for traceability"],
-        principle: "The Indexer only extracts facts that are explicitly stated in the document — it never infers or hallucinates. Every fact and section includes an original_quote field with the exact text from the source document in its original language, ensuring full traceability even when the output is translated.",
+        biz: "The Indexer is the foundation of every analysis. It converts unstructured document content into a structured, machine-readable format. All extracted data is automatically indexed in Azure AI Search, enabling instant semantic retrieval for the Analyzer and follow-up chat.",
+        tech: "Uses the Indexer model (default: GPT-4.1-mini, configurable via FOUNDRY_INDEXER_MODEL) via direct Chat Completions (single HTTP call) for maximum speed. Parses PDF, DOCX, TXT, XLSX via Python libraries and Azure AI Document Intelligence OCR for scans. For large documents (200+ pages), text is split into ~4,000-word overlapping chunks processed concurrently. All facts, sections, and numbers are indexed in Azure AI Search (vigil-facts index). Raw document chunks are also indexed (vigil-document-chunks) for follow-up chat grounding.",
+        how: ["Receives parsed text from all uploaded documents", "Single Chat Completions call per document", "For large docs: splits into chunks, processes concurrently", "Indexes structured facts in Azure AI Search (vigil-facts)", "Indexes raw document chunks in Azure AI Search (vigil-document-chunks)", "Outputs structured JSON fact sheet per document"],
+        principle: "The Indexer only extracts facts explicitly stated in the document — it never infers or hallucinates. All extracted data is indexed in Azure AI Search for instant semantic retrieval.",
       },
       analyzer: {
         title: "Agent 2 — Analyzer",
-        biz: "The Analyzer is the analytical engine. It takes the structured data from the Indexer and performs the specific comparison, compliance check, or cross-reference the user requested. This agent replaces hours of manual side-by-side document review with systematic, exhaustive analysis that doesn't miss details.",
-        tech: "Receives the Indexer's JSON output and a workflow-specific system prompt. Runs as a persistent agent in Azure AI Foundry Agent Service with its own thread per invocation. For version comparison, it diffs sections and classifies changes (ADDED/REMOVED/MODIFIED) with significance ratings. For compliance checks, it maps each reference requirement to the target document. For fact extraction, it consolidates facts and flags discrepancies. Output is structured JSON.",
-        how: ["Version Comparison — side-by-side section diff with impact ratings", "Compliance Check — requirement-by-requirement validation matrix", "Document Pack — completeness, conflict, and gap analysis", "Fact Extraction — master fact table with cross-document discrepancies", "Summary — theme identification and criticality assessment"],
+        biz: "The Analyzer is the analytical engine. It receives a compact structured fact and number block plus focused Azure AI Search context, enabling faster analysis without dropping key extracted values. It performs comparison, compliance check, or cross-reference as requested.",
+        tech: "Uses the Analyzer model (default: GPT-4.1-mini, configurable via FOUNDRY_ANALYZER_MODEL) via direct Chat Completions with a robust JSON parser that handles fences, extra data, and truncated output. Before analysis, the pipeline passes compact document summaries, the full structured facts and number registry from the Indexer, and focused Azure AI Search context from the vigil-facts index — reducing prompt size while preserving critical extracted data. Falls back to full Indexer JSON if Search is unavailable.",
+        how: ["Receives document summaries plus the full structured fact and number registry", "Adds focused Azure AI Search context instead of relying on a raw JSON dump", "Version Comparison — side-by-side section diff with impact ratings", "Compliance Check — requirement-by-requirement validation matrix", "Document Pack — completeness, conflict, and gap analysis", "Fact Extraction — master fact table with cross-document discrepancies", "Summary — theme identification and criticality assessment"],
         principle: "The Analyzer classifies every finding with a severity rating (HIGH/MEDIUM/LOW) and always cites the specific section in each document. This makes its output auditable and actionable.",
       },
       advisor: {
         title: "Agent 3 — Advisor",
-        biz: "The Advisor translates technical analysis into business-ready reports. It takes the Analyzer's structured findings and produces clear, executive-level markdown documents with tables, risk ratings, and prioritized action items. This is what stakeholders — legal, compliance, finance, C-suite — actually read and act on.",
-        tech: "Receives the Analyzer's JSON output and generates a markdown report. Runs as a persistent agent in Azure AI Foundry Agent Service with a slightly higher temperature (0.3) for more natural language. Each workflow produces a different report format: change logs for version comparison, compliance matrices for compliance checks, completeness checklists for document packs, fact sheets for extractions, and executive overviews for summaries.",
-        how: ["Executive Summary — 3-5 bullet points of the most critical findings", "Detailed Analysis — tables, matrices, or fact sheets depending on workflow", "Risk Highlights — severity-rated issues with 🔴🟡🟢 indicators", "Recommended Next Actions — numbered, prioritized steps to take"],
+        biz: "The Advisor translates technical analysis into business-ready reports. It produces clear, executive-level markdown documents with tables, risk ratings, and prioritized action items — streamed in real-time as they're generated.",
+        tech: "Uses the Advisor model (default: GPT-4.1, configurable via FOUNDRY_ADVISOR_MODEL) via direct Chat Completions with streaming output. Receives the Analyzer's JSON and generates a markdown report. Each workflow produces a different report format: change logs, compliance matrices, completeness checklists, fact sheets, or executive overviews. Reports stream to the UI in real-time.",
+        how: ["Executive Summary — key findings for senior leadership", "Detailed Analysis — tables, matrices, or fact sheets depending on workflow", "Risk Highlights — severity-rated issues with 🔴🟡🟢 indicators", "Recommended Next Actions — numbered, prioritized steps to take"],
         principle: "The Advisor always separates facts from interpretation and recommendations. It cites specific document sections for every finding, making the report fully traceable back to source documents.",
       },
     },
@@ -170,24 +171,24 @@ const T = {
     agent_modal: {
       indexer: {
         title: "Agent 1 — Indekser i ekstraktor faktów",
-        biz: "Indekser jest fundamentem każdej analizy. Konwertuje nieustrukturyzowaną treść dokumentów (umowy, polityki, arkusze) na ustrukturyzowany, czytelny maszynowo format. Eliminuje ręczne czytanie długich dokumentów i zapewnia, że każdy kolejny agent pracuje na tej samej bazie faktycznej — eliminując dryf interpretacyjny.",
-        tech: "Otrzymuje wyodrębnioną treść (tekst i tabele) z plików PDF, DOCX, TXT, XLSX i skanów obrazów (PNG, JPG, TIFF, BMP) przez parser dokumentów. Parser wykorzystuje biblioteki Python (PyMuPDF, python-docx, openpyxl) dla formatów tekstowych i Azure AI Document Intelligence OCR dla skanów. Działa jako trwały agent w Azure AI Foundry Agent Service. Dla małych dokumentów (≤30 stron) cały tekst jest wysyłany w jednym wywołaniu. Dla dużych dokumentów (200+ stron) tekst jest automatycznie dzielony na fragmenty ~4000 słów, przetwarzane równolegle (max 3 jednocześnie), a następnie wyodrębnione fakty są łączone z deduplikacją. Jeśli Azure AI Search jest skonfigurowany, fragmenty są indeksowane dla RAG w czacie uzupełniającym. Wyodrębnia: metadane dokumentu, nagłówki sekcji ze streszczeniami, ustrukturyzowane fakty oraz dokładne cytaty z dokumentu źródłowego (original_quote) zapewniające śledzalność.",
-        how: ["Otrzymuje sparsowany tekst ze wszystkich przesłanych dokumentów", "Dla dużych dok.: automatycznie dzieli na fragmenty ~4000 słów z nakładaniem", "Przetwarza fragmenty równolegle (max 3) przez oddzielne wątki agenta", "Łączy wyniki fragmentów w jeden arkusz faktów z deduplikacją", "Opcjonalnie indeksuje fragmenty w Azure AI Search dla RAG", "Zwraca ustrukturyzowany arkusz faktów JSON z polami original_quote dla śledzalności"],
-        principle: "Indekser wyodrębnia tylko fakty jawnie zawarte w dokumencie — nigdy nie wnioskuje ani nie halucynuje. Każdy fakt i sekcja zawiera pole original_quote z dokładnym tekstem z dokumentu źródłowego w oryginalnym języku, zapewniając pełną śledzalność nawet gdy wynik jest tłumaczony.",
+        biz: "Indekser jest fundamentem każdej analizy. Konwertuje nieustrukturyzowaną treść dokumentów na ustrukturyzowany format. Wszystkie wyodrębnione dane są automatycznie indeksowane w Azure AI Search, umożliwiając natychmiastowe wyszukiwanie semantyczne dla Analizatora i czatu.",
+        tech: "Używa modelu Indexer (domyślnie: GPT-4.1-mini, konfigurowalne przez FOUNDRY_INDEXER_MODEL) przez bezpośrednie wywołanie Chat Completions (pojedyncze zapytanie HTTP) dla maksymalnej szybkości. Parsuje PDF, DOCX, TXT, XLSX bibliotekami Python i Azure AI Document Intelligence OCR dla skanów. Dla dużych dokumentów (200+ stron) tekst jest dzielony na fragmenty ~4000 słów przetwarzane równolegle. Wszystkie fakty, sekcje i liczby są indeksowane w Azure AI Search (indeks vigil-facts). Surowe fragmenty dokumentów również (vigil-document-chunks) dla czatu.",
+        how: ["Otrzymuje sparsowany tekst ze wszystkich dokumentów", "Pojedyncze wywołanie Chat Completions na dokument", "Dla dużych dok.: dzieli na fragmenty, przetwarza równolegle", "Indeksuje fakty w Azure AI Search (vigil-facts)", "Indeksuje fragmenty dokumentów w Azure AI Search (vigil-document-chunks)", "Zwraca ustrukturyzowany arkusz faktów JSON"],
+        principle: "Indekser wyodrębnia tylko fakty jawnie zawarte w dokumencie — nigdy nie wnioskuje ani nie halucynuje. Wszystkie dane są indeksowane w Azure AI Search dla natychmiastowego wyszukiwania semantycznego.",
       },
       analyzer: {
         title: "Agent 2 — Analizator",
-        biz: "Analizator jest silnikiem analitycznym. Pobiera ustrukturyzowane dane z Indeksera i przeprowadza konkretne porównanie, kontrolę zgodności lub krzyżową weryfikację, o którą poprosił użytkownik. Ten agent zastępuje godziny ręcznego porównywania dokumentów systematyczną, wyczerpującą analizą, która nie pomija szczegółów.",
-        tech: "Otrzymuje dane JSON z Indeksera i prompt systemowy specyficzny dla wybranego workflow. Działa jako trwały agent w Azure AI Foundry Agent Service z własnym wątkiem dla każdego wywołania. Dla porównania wersji różnicuje sekcje i klasyfikuje zmiany (DODANE/USUNIĘTE/ZMODYFIKOWANE) z oceną istotności. Dla kontroli zgodności mapuje każde wymaganie referencyjne do dokumentu docelowego. Dla ekstrakcji faktów konsoliduje fakty i flaguje rozbieżności. Wynik to ustrukturyzowany JSON.",
-        how: ["Porównanie wersji — różnicowanie sekcja po sekcji z oceną wpływu", "Kontrola zgodności — matryca walidacji wymaganie po wymaganiu", "Pakiet dokumentów — analiza kompletności, konfliktów i braków", "Ekstrakcja faktów — główna tabela faktów z rozbieżnościami międzydokumentowymi", "Podsumowanie — identyfikacja tematów i ocena krytyczności"],
-        principle: "Analizator klasyfikuje każde znalezisko z oceną istotności (WYSOKA/ŚREDNIA/NISKA) i zawsze cytuje konkretną sekcję w każdym dokumencie. To czyni jego wynik audytowalnym i praktycznym.",
+        biz: "Analizator jest silnikiem analitycznym. Otrzymuje zwarty blok faktów i liczb oraz skoncentrowany kontekst z Azure AI Search, co przyspiesza analizę bez gubienia kluczowych danych wyodrębnionych przez Indexer. Przeprowadza porównanie, kontrolę zgodności lub krzyżową weryfikację.",
+        tech: "Używa modelu Analyzer (domyślnie: GPT-4.1-mini, konfigurowalne przez FOUNDRY_ANALYZER_MODEL) przez bezpośrednie wywołanie Chat Completions z odpornym parserem JSON obsługującym markdown fences, dodatkowe dane i ucięty wynik. Przed analizą pipeline przekazuje zwarte podsumowania dokumentów, pełny rejestr faktów i liczb z Indexera oraz skoncentrowany kontekst z Azure AI Search (indeks vigil-facts) — redukując rozmiar prompta przy zachowaniu krytycznych danych.",
+        how: ["Otrzymuje podsumowania dokumentów oraz pełny rejestr faktów i liczb", "Dodaje skoncentrowany kontekst z Azure AI Search zamiast polegać na pełnym zrzucie JSON", "Porównanie wersji — różnicowanie sekcja po sekcji z oceną wpływu", "Kontrola zgodności — matryca walidacji wymaganie po wymaganiu", "Pakiet dokumentów — analiza kompletności, konfliktów i braków", "Ekstrakcja faktów — główna tabela faktów z rozbieżnościami", "Podsumowanie — identyfikacja tematów i ocena krytyczności"],
+        principle: "Analizator klasyfikuje każde znalezisko z oceną istotności (WYSOKA/ŚREDNIA/NISKA) i zawsze cytuje konkretne sekcje dokumentów.",
       },
       advisor: {
         title: "Agent 3 — Doradca",
-        biz: "Doradca przekłada analizę techniczną na raporty gotowe dla biznesu. Pobiera ustrukturyzowane wyniki Analizatora i tworzy czytelne dokumenty markdown na poziomie zarządu z tabelami, ocenami ryzyka i priorytetyzowanymi działaniami. To jest to, co interesariusze — dział prawny, compliance, finanse, zarząd — faktycznie czytają i na podstawie czego działają.",
-        tech: "Otrzymuje dane JSON z Analizatora i generuje raport markdown. Działa jako trwały agent w Azure AI Foundry Agent Service z nieco wyższą temperaturą (0.3) dla bardziej naturalnego języka. Każdy workflow produkuje inny format raportu: dzienniki zmian dla porównania wersji, matryca zgodności dla kontroli, listy kompletności dla pakietów dokumentów, arkusze faktów dla ekstrakcji i przeglądy dla podsumowań.",
-        how: ["Podsumowanie wykonawcze — 3-5 punktów najważniejszych ustaleń", "Szczegółowa analiza — tabele, matryca lub arkusze w zależności od workflow", "Zagrożenia — problemy z oceną istotności 🔴🟡🟢", "Rekomendowane działania — ponumerowane, priorytetyzowane kroki"],
-        principle: "Doradca zawsze oddziela fakty od interpretacji i rekomendacji. Cytuje konkretne sekcje dokumentów dla każdego ustalenia, dzięki czemu raport jest w pełni śledzalny do dokumentów źródłowych.",
+        biz: "Doradca przekłada analizę techniczną na raporty gotowe dla biznesu. Tworzy czytelne dokumenty markdown z tabelami, ocenami ryzyka i priorytetyzowanymi działaniami — streamowane w czasie rzeczywistym.",
+        tech: "Używa modelu Advisor (domyślnie: GPT-4.1, konfigurowalne przez FOUNDRY_ADVISOR_MODEL) przez bezpośrednie wywołanie Chat Completions ze streamingiem. Otrzymuje JSON z Analizatora i generuje raport markdown. Każdy workflow ma inny format raportu. Raporty są streamowane do UI w czasie rzeczywistym.",
+        how: ["Podsumowanie wykonawcze — kluczowe ustalenia dla kadry zarządzającej", "Szczegółowa analiza — tabele, matryca lub arkusze w zależności od workflow", "Zagrożenia — problemy z oceną istotności 🔴🟡🟢", "Rekomendowane działania — ponumerowane, priorytetyzowane kroki"],
+        principle: "Doradca zawsze oddziela fakty od interpretacji i rekomendacji. Cytuje konkretne sekcje dokumentów dla każdego ustalenia.",
       },
     },
   },
@@ -395,8 +396,11 @@ function bindUpload() {
 }
 
 async function handleFiles(fileList) {
+  if (!fileList || !fileList.length) return;
+
   const fd = new FormData();
   for (const f of fileList) fd.append("files", f);
+  if (currentUploadId) fd.append("upload_id", currentUploadId);
 
   // Show loading overlay
   const zone = document.getElementById("drop-zone");
@@ -407,7 +411,24 @@ async function handleFiles(fileList) {
   try {
     const res = await fetch("/api/upload", { method: "POST", body: fd });
     const data = await res.json();
-    if (data._parsed) { for (const d of data._parsed) uploadedDocuments.push(d); renderUploadedFiles(); updateUploadBtn(); }
+
+    if (!res.ok) {
+      if (res.status === 410) {
+        currentUploadId = null;
+        uploadedDocuments = [];
+        renderUploadedFiles();
+        updateUploadBtn();
+      }
+      showUploadError(data.error || "Upload failed — please try again.");
+      return;
+    }
+
+    if (data.upload_id) currentUploadId = data.upload_id;
+    if (Array.isArray(data.documents) && data.documents.length) {
+      uploadedDocuments.push(...data.documents);
+      renderUploadedFiles();
+      updateUploadBtn();
+    }
     if (data.errors && data.errors.length) {
       const names = data.errors.map(e => e.filename).join(", ");
       showUploadError(`Failed to parse: ${names}`);
@@ -457,12 +478,34 @@ async function startPipeline() {
   if (!selectedWorkflow) return; goToStep(3); resetProcessingUI();
   const allDocs = [...uploadedDocuments];
   if (!allDocs.length) { addLog(t("log_no_docs"), "red"); return; }
+  if (!currentUploadId) {
+    addLog(t("log_error").replace("{msg}", "Upload session expired. Please upload your files again."), "red");
+    return;
+  }
   addLog(t("log_starting").replace("{wf}", wfLabel(selectedWorkflow)).replace("{n}", allDocs.length), "blue");
   try {
-    const data = await (await fetch("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ workflow: selectedWorkflow, documents: allDocs, language: currentLang, custom_instructions: document.getElementById('custom-input').value.trim() }) })).json();
+    const res = await fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        workflow: selectedWorkflow,
+        upload_id: currentUploadId,
+        document_ids: allDocs.map(doc => doc.id),
+        language: currentLang,
+        custom_instructions: document.getElementById("custom-input").value.trim(),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to start analysis");
     currentJobId = data.job_id; addLog(t("log_job").replace("{id}", currentJobId), "blue");
     streamJob(currentJobId);
-  } catch (e) { addLog(t("log_error").replace("{msg}", e.message), "red"); }
+  } catch (e) {
+    addLog(t("log_error").replace("{msg}", e.message), "red");
+    if ((e.message || "").toLowerCase().includes("upload session expired")) {
+      currentUploadId = null;
+      goToStep(1);
+    }
+  }
 }
 
 let streamingReportText = "";
@@ -552,7 +595,7 @@ function renderResults(job) {
 }
 function bindResultTabs() { document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => { document.querySelectorAll(".tab-btn").forEach(x => x.classList.remove("active")); b.classList.add("active"); document.querySelectorAll(".result-panel").forEach(p => p.classList.add("hidden")); document.getElementById(`result-${b.dataset.tab}`).classList.remove("hidden"); })); }
 function copyReport() { const txt = document.getElementById("result-report").innerText; navigator.clipboard.writeText(txt).then(() => { const b = document.querySelector("#page-4 .btn-primary"); const o = b.innerHTML; b.innerHTML = `<i class="ri-check-line"></i> ${t("res_copied")}`; setTimeout(() => b.innerHTML = o, 1500); }); }
-function resetAll() { if (eventSource) { eventSource.close(); eventSource = null; } uploadedDocuments=[]; selectedWorkflow=null; currentJobId=null; chatHistory=[]; streamingReportText=""; document.querySelectorAll(".wf-card").forEach(c=>c.classList.remove("selected")); document.getElementById("uploaded-files").innerHTML=""; document.getElementById("btn-to-workflow").disabled=true; document.getElementById("btn-run").disabled=true; document.getElementById("chat-messages").innerHTML=""; document.getElementById("custom-input").value=""; document.getElementById("chat-panel").classList.remove("open"); document.getElementById("chat-backdrop").classList.remove("open"); goToStep(0); }
+function resetAll() { if (eventSource) { eventSource.close(); eventSource = null; } uploadedDocuments=[]; currentUploadId=null; selectedWorkflow=null; currentJobId=null; chatHistory=[]; streamingReportText=""; document.querySelectorAll(".wf-card").forEach(c=>c.classList.remove("selected")); document.getElementById("uploaded-files").innerHTML=""; document.getElementById("btn-to-workflow").disabled=true; document.getElementById("btn-run").disabled=true; document.getElementById("chat-messages").innerHTML=""; document.getElementById("custom-input").value=""; document.getElementById("chat-panel").classList.remove("open"); document.getElementById("chat-backdrop").classList.remove("open"); goToStep(0); }
 
 // ═══ AGENT DETAIL MODALS ═══════════════════════════════
 function openAgentModal(agentId) {
@@ -574,10 +617,11 @@ function openAgentModal(agentId) {
     <div class="modal-section"><h3><i class="ri-shield-star-line"></i> ${t("modal_principle")}</h3><p>${am.principle}</p></div>
     <div class="modal-tag-row">
       <span class="modal-tag tech">Azure AI Foundry</span>
-      <span class="modal-tag tech">Agent Service</span>
-      <span class="modal-tag tech">${agentId === "advisor" ? "GPT-4.1" : "GPT-4.1-mini"}</span>
+      <span class="modal-tag tech">${agentId === "indexer" ? "Chat Completions" : agentId === "analyzer" ? "Chat Completions" : "Streaming"}</span>
+      <span class="modal-tag tech">${agentId === "indexer" ? "Indexer model" : agentId === "analyzer" ? "Analyzer model" : "Advisor model"}</span>
       <span class="modal-tag tech">${agentId === "advisor" ? "Markdown" : "JSON"} output</span>
       ${agentId === "advisor" ? '<span class="modal-tag tech">Streaming</span>' : ''}
+      ${agentId !== "advisor" ? '<span class="modal-tag tech">Azure AI Search</span>' : ''}
       <span class="modal-tag biz">${currentLang === "pl" ? "Analiza dokumentów" : "Document analysis"}</span>
     </div>
   </div>`;
@@ -620,12 +664,39 @@ function showTourForPage(page) {
 
 // ═══ UTILITIES ═════════════════════════════════════════
 function esc(s) { const d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
+function sanitizeHtml(html) {
+  if (typeof DOMPurify !== "undefined") {
+    return DOMPurify.sanitize(html, {
+      USE_PROFILES: { html: true },
+    });
+  }
+  return html;
+}
+
+function addSafeLinkAttrs(html) {
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = html;
+  wrapper.querySelectorAll("a[href]").forEach(link => {
+    const href = link.getAttribute("href") || "";
+    if (/^https?:\/\//i.test(href)) {
+      link.setAttribute("target", "_blank");
+      link.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+  return wrapper.innerHTML;
+}
+
 function renderMD(txt) {
   // Clean up literal \n that LLM agents sometimes emit inside markdown table cells
   txt = txt.replace(/(?<=\|[^|]*?)\\n(?=[^|]*?\|)/g, '<br>');
   // Also clean up any remaining literal \n outside tables
   txt = txt.replace(/\\n/g, '\n');
-  if (typeof marked !== "undefined") { marked.setOptions({ breaks: true, gfm: true }); return marked.parse(txt); } return `<pre>${esc(txt)}</pre>`;
+  let html = `<pre>${esc(txt)}</pre>`;
+  if (typeof marked !== "undefined") {
+    marked.setOptions({ breaks: true, gfm: true });
+    html = marked.parse(txt);
+  }
+  return addSafeLinkAttrs(sanitizeHtml(html));
 }
 function wfLabel(w) {
   const key = `wfl_${w}`;
