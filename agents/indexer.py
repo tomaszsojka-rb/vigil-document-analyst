@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 
 from foundry_client import get_agents_client, get_indexer_model_name, get_inference_client
 
@@ -65,6 +66,8 @@ RULES:
 
 AGENT_NAME = "vigil-indexer"
 INDEXER_RETRY_ATTEMPTS = max(1, int(os.getenv("INDEXER_RETRY_ATTEMPTS", "2")))
+INDEXER_CALL_RETRY_ATTEMPTS = max(1, int(os.getenv("INDEXER_CALL_RETRY_ATTEMPTS", "3")))
+INDEXER_CALL_RETRY_BACKOFF_SECONDS = max(0.2, float(os.getenv("INDEXER_CALL_RETRY_BACKOFF_SECONDS", "2.0")))
 FALLBACK_MAX_NUMBERS = max(20, int(os.getenv("INDEXER_FALLBACK_MAX_NUMBERS", "200")))
 FALLBACK_QUOTE_MAX_CHARS = max(2000, int(os.getenv("INDEXER_FALLBACK_QUOTE_MAX_CHARS", "12000")))
 
@@ -110,7 +113,7 @@ async def run_indexer(documents: list[dict], language: str = "en", custom_instru
 
     # Single chat completion call with retry + robust JSON parsing
     loop = asyncio.get_running_loop()
-    parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_sync, user_message)
+    parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_with_retries_sync, user_message)
 
     if parsed:
         if "documents" in parsed:
@@ -259,6 +262,29 @@ def _call_and_parse_indexer_sync(user_message: str) -> tuple[dict | None, str]:
     return None, last_text
 
 
+def _call_and_parse_indexer_with_retries_sync(user_message: str) -> tuple[dict | None, str]:
+    """Call Indexer with retry on transport/runtime failures (timeouts, transient errors)."""
+    last_exc: Exception | None = None
+
+    for attempt in range(1, INDEXER_CALL_RETRY_ATTEMPTS + 1):
+        try:
+            return _call_and_parse_indexer_sync(user_message)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= INDEXER_CALL_RETRY_ATTEMPTS:
+                break
+            delay = INDEXER_CALL_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+            logger.warning(
+                "Indexer call failed on attempt %d/%d (%s). Retrying in %.1fs...",
+                attempt, INDEXER_CALL_RETRY_ATTEMPTS, exc, delay,
+            )
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"Indexer call failed after {INDEXER_CALL_RETRY_ATTEMPTS} attempts: {last_exc}"
+    ) from last_exc
+
+
 def _normalize_single_doc_result(doc_result: dict, doc_idx: int, filename: str) -> dict:
     """Normalize a single Indexer document object to expected structural fields."""
     normalized = dict(doc_result or {})
@@ -334,15 +360,22 @@ async def run_indexer_parallel(documents: list[dict], language: str = "en", cust
                 f"{'=' * 60}\nDOCUMENT {doc_idx}: {filename}\n{'=' * 60}\n{content}"
             )
             loop = asyncio.get_running_loop()
-            parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_sync, user_message)
-            if parsed:
-                if "documents" in parsed and parsed["documents"]:
-                    doc_result = _normalize_single_doc_result(parsed["documents"][0], doc_idx, filename)
-                    return doc_result
-                return _normalize_single_doc_result(parsed, doc_idx, filename)
+            try:
+                parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_with_retries_sync, user_message)
+                if parsed:
+                    if "documents" in parsed and parsed["documents"]:
+                        doc_result = _normalize_single_doc_result(parsed["documents"][0], doc_idx, filename)
+                        return doc_result
+                    return _normalize_single_doc_result(parsed, doc_idx, filename)
 
-            logger.warning("[parallel] Doc %d '%s' returned non-JSON after retries", doc_idx, filename)
-            return _build_fallback_doc_result(doc_idx, filename, content)
+                logger.warning("[parallel] Doc %d '%s' returned non-JSON after retries", doc_idx, filename)
+                return _build_fallback_doc_result(doc_idx, filename, content)
+            except Exception as exc:
+                logger.error(
+                    "[parallel] Doc %d '%s' failed after retries, using fallback: %s",
+                    doc_idx, filename, exc,
+                )
+                return _build_fallback_doc_result(doc_idx, filename, content)
 
     tasks = [_handle_doc(i, doc) for i, doc in enumerate(documents, 1)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -417,27 +450,43 @@ async def _process_single_chunk(sem, chunk, filename, doc_idx, total_chunks, lan
         )
 
         loop = asyncio.get_running_loop()
-        parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_sync, user_message)
-        if parsed:
-            if "documents" in parsed:
-                normalized = []
-                for i, raw_doc in enumerate(parsed.get("documents", []), 1):
-                    if isinstance(raw_doc, dict):
-                        normalized.append(_normalize_single_doc_result(raw_doc, doc_idx, filename))
-                return {**parsed, "documents": normalized}
-            return {"documents": [_normalize_single_doc_result(parsed, doc_idx, filename)]}
+        try:
+            parsed, text = await loop.run_in_executor(None, _call_and_parse_indexer_with_retries_sync, user_message)
+            if parsed:
+                if "documents" in parsed:
+                    normalized = []
+                    for i, raw_doc in enumerate(parsed.get("documents", []), 1):
+                        if isinstance(raw_doc, dict):
+                            normalized.append(_normalize_single_doc_result(raw_doc, doc_idx, filename))
+                    return {**parsed, "documents": normalized}
+                return {"documents": [_normalize_single_doc_result(parsed, doc_idx, filename)]}
 
-        logger.warning("[chunked] Chunk %d returned non-JSON after retries", chunk["index"] + 1)
-        fallback_doc = _build_fallback_doc_result(
-            doc_idx,
-            filename,
-            chunk.get("content", ""),
-            doc_id=f"doc-{doc_idx}-chunk-{chunk['index'] + 1}",
-        )
-        fallback_doc["document_overview"] = (
-            f"Fallback extraction for chunk {chunk['index'] + 1}/{total_chunks} due to malformed model output."
-        )
-        return {"documents": [fallback_doc], "raw_output": text}
+            logger.warning("[chunked] Chunk %d returned non-JSON after retries", chunk["index"] + 1)
+            fallback_doc = _build_fallback_doc_result(
+                doc_idx,
+                filename,
+                chunk.get("content", ""),
+                doc_id=f"doc-{doc_idx}-chunk-{chunk['index'] + 1}",
+            )
+            fallback_doc["document_overview"] = (
+                f"Fallback extraction for chunk {chunk['index'] + 1}/{total_chunks} due to malformed model output."
+            )
+            return {"documents": [fallback_doc], "raw_output": text}
+        except Exception as exc:
+            logger.error(
+                "[chunked] Chunk %d/%d of '%s' failed after retries, using fallback: %s",
+                chunk["index"] + 1, total_chunks, filename, exc,
+            )
+            fallback_doc = _build_fallback_doc_result(
+                doc_idx,
+                filename,
+                chunk.get("content", ""),
+                doc_id=f"doc-{doc_idx}-chunk-{chunk['index'] + 1}",
+            )
+            fallback_doc["document_overview"] = (
+                f"Fallback extraction for chunk {chunk['index'] + 1}/{total_chunks} due to model call failure."
+            )
+            return {"documents": [fallback_doc]}
 
 
 def _merge_chunk_facts(chunk_results: list[dict], doc_idx: int, filename: str) -> dict:
