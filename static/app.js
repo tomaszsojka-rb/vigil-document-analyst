@@ -58,6 +58,11 @@ const T = {
     res_title: "Analysis Results", res_desc: "All three agents have completed. Here's your report.",
     res_tab_report: "Final Report", res_tab_indexer: "Indexer Output", res_tab_analyzer: "Analyzer Output",
     res_new: "New Analysis", res_copy: "Copy Report", res_copied: "Copied!",
+    res_export_pdf: "Export PDF", res_export_docx: "Export Word",
+    res_exporting_pdf: "Exporting PDF…", res_exporting_docx: "Exporting Word…",
+    res_no_report: "No report to export yet.",
+    res_export_not_supported: "Export is not available in this browser.",
+    res_export_failed: "Export failed. Please try again.",
     // Custom instructions + chat
     custom_label: "Custom Instructions", custom_optional: "(optional)",
     custom_placeholder: "Tell Vigil what to focus on, e.g. 'Pay special attention to liability clauses and payment terms'\u2026",
@@ -146,6 +151,11 @@ const T = {
     res_title: "Wyniki analizy", res_desc: "Wszystkie trzy agenty zakończyły pracę. Oto Twój raport.",
     res_tab_report: "Raport końcowy", res_tab_indexer: "Wynik indeksera", res_tab_analyzer: "Wynik analizatora",
     res_new: "Nowa analiza", res_copy: "Kopiuj raport", res_copied: "Skopiowano!",
+    res_export_pdf: "Eksport PDF", res_export_docx: "Eksport Word",
+    res_exporting_pdf: "Eksport PDF…", res_exporting_docx: "Eksport Word…",
+    res_no_report: "Brak raportu do eksportu.",
+    res_export_not_supported: "Eksport nie jest dostępny w tej przeglądarce.",
+    res_export_failed: "Nie udało się wyeksportować raportu. Spróbuj ponownie.",
     custom_label: "Instrukcje dodatkowe", custom_optional: "(opcjonalnie)",
     custom_placeholder: "Powiedz Vigil, na czym si\u0119 skupi\u0107, np. \u2018Zwr\u00f3\u0107 szczeg\u00f3ln\u0105 uwag\u0119 na klauzule odpowiedzialno\u015bci i warunki p\u0142atno\u015bci\u2019\u2026",
     chat_title: "Czat uzupe\u0142niaj\u0105cy", chat_desc: "Zadawaj pytania o analiz\u0119, pro\u015b o wi\u0119cej szczeg\u00f3\u0142\u00f3w lub eksploruj dalej.",
@@ -326,9 +336,14 @@ function applyLanguage() {
   const tabs = document.querySelectorAll(".tab-btn");
   const tabKeys = ["res_tab_report", "res_tab_indexer", "res_tab_analyzer"];
   tabs.forEach((tab, i) => { if (tabKeys[i]) tab.textContent = t(tabKeys[i]); });
-  const resActions = document.querySelectorAll("#page-4 .page-actions button");
-  if (resActions[0]) resActions[0].innerHTML = `<i class="ri-restart-line"></i> ${t("res_new")}`;
-  if (resActions[1]) resActions[1].innerHTML = `<i class="ri-file-copy-line"></i> ${t("res_copy")}`;
+  const btnNew = document.querySelector("#page-4 .page-actions .btn-secondary");
+  if (btnNew) btnNew.innerHTML = `<i class="ri-restart-line"></i> ${t("res_new")}`;
+  const btnCopy = document.getElementById("btn-copy-report");
+  if (btnCopy) btnCopy.innerHTML = `<i class="ri-file-copy-line"></i> ${t("res_copy")}`;
+  const btnExportPdf = document.getElementById("btn-export-pdf");
+  if (btnExportPdf) btnExportPdf.innerHTML = `<i class="ri-file-pdf-2-line"></i> ${t("res_export_pdf")}`;
+  const btnExportDocx = document.getElementById("btn-export-docx");
+  if (btnExportDocx) btnExportDocx.innerHTML = `<i class="ri-file-word-2-line"></i> ${t("res_export_docx")}`;
 
   // Custom instructions
   const ciLabel = document.querySelector(".custom-instructions label");
@@ -594,7 +609,165 @@ function renderResults(job) {
   document.getElementById("result-analyzer").innerHTML = ana ? `<pre><code>${esc(JSON.stringify(ana,null,2))}</code></pre>` : "<p>No data.</p>";
 }
 function bindResultTabs() { document.querySelectorAll(".tab-btn").forEach(b => b.addEventListener("click", () => { document.querySelectorAll(".tab-btn").forEach(x => x.classList.remove("active")); b.classList.add("active"); document.querySelectorAll(".result-panel").forEach(p => p.classList.add("hidden")); document.getElementById(`result-${b.dataset.tab}`).classList.remove("hidden"); })); }
-function copyReport() { const txt = document.getElementById("result-report").innerText; navigator.clipboard.writeText(txt).then(() => { const b = document.querySelector("#page-4 .btn-primary"); const o = b.innerHTML; b.innerHTML = `<i class="ri-check-line"></i> ${t("res_copied")}`; setTimeout(() => b.innerHTML = o, 1500); }); }
+function copyReport() {
+  const txt = document.getElementById("result-report").innerText;
+  navigator.clipboard.writeText(txt).then(() => {
+    const b = document.getElementById("btn-copy-report");
+    if (!b) return;
+    const o = b.innerHTML;
+    b.innerHTML = `<i class="ri-check-line"></i> ${t("res_copied")}`;
+    setTimeout(() => b.innerHTML = `<i class="ri-file-copy-line"></i> ${t("res_copy")}`, 1500);
+    if (!o) b.innerHTML = `<i class="ri-file-copy-line"></i> ${t("res_copy")}`;
+  });
+}
+
+function getReportElement() {
+  return document.getElementById("result-report");
+}
+
+function hasExportableReport() {
+  const reportEl = getReportElement();
+  return reportEl && reportEl.innerText.trim().length > 0;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function makeReportFilename(ext) {
+  const baseLabel = selectedWorkflow ? wfLabel(selectedWorkflow) : "report";
+  const safeBase = baseLabel.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "report";
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `vigil-${safeBase}-${yyyy}-${mm}-${dd}.${ext}`;
+}
+
+function buildExportHtml(contentHtml) {
+  return `<!doctype html>
+<html lang="${currentLang}">
+<head>
+  <meta charset="utf-8">
+  <title>Vigil Report</title>
+  <style>
+    body { margin: 0; padding: 24px; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1e293b; line-height: 1.7; font-size: 13px; background: #ffffff; }
+    .report { max-width: 980px; margin: 0 auto; }
+    h1, h2, h3, h4 { margin: 14px 0 6px; color: #1e293b; }
+    h1 { font-size: 20px; } h2 { font-size: 17px; } h3 { font-size: 15px; } h4 { font-size: 14px; }
+    p { margin: 5px 0; }
+    ul, ol { padding-left: 18px; margin: 6px 0; }
+    li { margin: 3px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 10px 0; table-layout: fixed; }
+    th, td { border: 1px solid #e3e8ef; padding: 7px 10px; text-align: left; vertical-align: top; word-break: break-word; }
+    th { background: #f0f3f8; font-weight: 600; }
+    code { background: #f0f3f8; padding: 2px 6px; border-radius: 4px; font-size: .9em; }
+    pre { background: #f0f3f8; padding: 12px; border-radius: 10px; overflow: auto; margin: 8px 0; }
+    pre code { background: none; padding: 0; }
+    blockquote { border-left: 3px solid #003B71; padding-left: 14px; color: #475569; margin: 8px 0; }
+  </style>
+</head>
+<body><div class="report">${contentHtml}</div></body>
+</html>`;
+}
+
+async function exportReportPdf() {
+  if (!hasExportableReport()) {
+    alert(t("res_no_report"));
+    return;
+  }
+  if (typeof html2pdf === "undefined") {
+    alert(t("res_export_not_supported"));
+    return;
+  }
+
+  const btn = document.getElementById("btn-export-pdf");
+  const oldHtml = btn ? btn.innerHTML : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `<i class="ri-loader-4-line"></i> ${t("res_exporting_pdf")}`;
+  }
+
+  try {
+    const reportEl = getReportElement();
+    const clone = reportEl.cloneNode(true);
+    clone.style.background = "#ffffff";
+    clone.style.border = "none";
+    clone.style.borderRadius = "0";
+    clone.style.padding = "0";
+    clone.style.fontSize = "13px";
+    clone.querySelectorAll("table, tr, td, th").forEach(el => {
+      el.style.pageBreakInside = "avoid";
+    });
+
+    const container = document.createElement("div");
+    container.style.background = "#ffffff";
+    container.style.padding = "16px";
+    container.style.maxWidth = "980px";
+    container.appendChild(clone);
+
+    const opts = {
+      margin: [8, 8, 8, 8],
+      filename: makeReportFilename("pdf"),
+      image: { type: "jpeg", quality: 0.98 },
+      html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
+      jsPDF: { unit: "mm", format: "a4", orientation: "portrait" },
+      pagebreak: { mode: ["css", "legacy"] },
+    };
+
+    await html2pdf().set(opts).from(container).save();
+  } catch (err) {
+    alert(t("res_export_failed"));
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = oldHtml || `<i class="ri-file-pdf-2-line"></i> ${t("res_export_pdf")}`;
+    }
+  }
+}
+
+async function exportReportDocx() {
+  if (!hasExportableReport()) {
+    alert(t("res_no_report"));
+    return;
+  }
+  if (!window.htmlDocx || typeof window.htmlDocx.asBlob !== "function") {
+    alert(t("res_export_not_supported"));
+    return;
+  }
+
+  const btn = document.getElementById("btn-export-docx");
+  const oldHtml = btn ? btn.innerHTML : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = `<i class="ri-loader-4-line"></i> ${t("res_exporting_docx")}`;
+  }
+
+  try {
+    const reportEl = getReportElement();
+    const htmlDoc = buildExportHtml(reportEl.innerHTML);
+    const blob = window.htmlDocx.asBlob(htmlDoc, {
+      orientation: "portrait",
+      margins: { top: 720, right: 720, bottom: 720, left: 720 },
+    });
+    downloadBlob(blob, makeReportFilename("docx"));
+  } catch (err) {
+    alert(t("res_export_failed"));
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = oldHtml || `<i class="ri-file-word-2-line"></i> ${t("res_export_docx")}`;
+    }
+  }
+}
+
 function resetAll() { if (eventSource) { eventSource.close(); eventSource = null; } uploadedDocuments=[]; currentUploadId=null; selectedWorkflow=null; currentJobId=null; chatHistory=[]; streamingReportText=""; document.querySelectorAll(".wf-card").forEach(c=>c.classList.remove("selected")); document.getElementById("uploaded-files").innerHTML=""; document.getElementById("btn-to-workflow").disabled=true; document.getElementById("btn-run").disabled=true; document.getElementById("chat-messages").innerHTML=""; document.getElementById("custom-input").value=""; document.getElementById("chat-panel").classList.remove("open"); document.getElementById("chat-backdrop").classList.remove("open"); goToStep(0); }
 
 // ═══ AGENT DETAIL MODALS ═══════════════════════════════

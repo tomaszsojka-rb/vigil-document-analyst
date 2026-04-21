@@ -299,6 +299,10 @@ body { font-family: var(--font); background: var(--bg); color: var(--text); disp
 .btn-primary:disabled { opacity: .4; cursor: not-allowed; transform: none; }
 .btn-secondary { background: var(--bg-white); color: var(--text-secondary); border: 1px solid var(--border); }
 .btn-secondary:hover { background: var(--bg-card-hover); color: var(--text); }
+.btn-export-pdf { background: #c2410c; }
+.btn-export-pdf:hover { background: #9a3412; }
+.btn-export-docx { background: #1d4ed8; }
+.btn-export-docx:hover { background: #1e40af; }
 
 /* ─── Scrollbar ─── */
 ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; }
